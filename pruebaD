@@ -1,0 +1,84 @@
+import pandas as pd
+import os
+
+# Rutas de tus archivos CSV
+base_path = 'C:/Users/s37841/12DDesktop/PROYECTOS/ANALISIS_TXN_PLINRESP_121112026/'
+archivos_csv = {
+    '06-07': f'{base_path}Resp_svr_121 2025_060700mxs.csv',
+    '07-08': f'{base_path}Resp_svr_121 2025_070839mxs.csv',
+    '08-09': f'{base_path}Resp_svr_121 2025_080839mxs.csv',
+    '09-10': f'{base_path}Resp_svr_121 2025_090126mxs.csv',
+    '10-11': f'{base_path}Resp_svr_121 2025_100126mxs.csv',
+    '11-12': f'{base_path}Resp_svr_121 2025_110126mxs.csv',
+    '12-13': f'{base_path}Resp_svr_121 2025_120126mxs.csv',
+    '13-14': f'{base_path}Resp_svr_121 2025_130126mxs.csv',
+    '14-15': f'{base_path}Resp_svr_121 2025_140126mxs.csv',
+    '15-16': f'{base_path}Resp_svr_121 2025_150126mxs.csv',
+    '16-17': f'{base_path}Resp_svr_121 2025_160126mxs.csv',
+    '17-18': f'{base_path}Resp_svr_121 2025_170126mxs.csv',
+    '18-19': f'{base_path}Resp_svr_121 2025_180126mxs.csv',
+    '19-20': f'{base_path}Resp_svr_121 2025_190126mxs.csv',
+    '20-21': f'{base_path}Resp_svr_121 2025_200126mxs.csv',
+    '21-22': f'{base_path}Resp_svr_121 2025_220143.csv',
+}
+
+# Rangos de tiempo en segundos
+rangos_tiempo = [(i, i+1) for i in range(60)]
+
+# Crear dataframe para resultados
+resultados = pd.DataFrame(
+    index=[f'{r[0]}-{r[1]}s' for r in rangos_tiempo],
+    columns=list(archivos_csv.keys())
+)
+
+# Procesar cada archivo
+print('Iniciando análisis...\n')
+for horario, ruta_csv in archivos_csv.items():
+    try:
+        if not os.path.exists(ruta_csv):
+            print(f'⚠ Archivo no encontrado: {horario}')
+            resultados[horario] = 0
+            continue
+            
+        # Leer CSV
+        df = pd.read_csv(ruta_csv)
+        
+        # Calcular duración en segundos
+        df['TimeIn'] = pd.to_datetime(df['TimeIn'])
+        df['TimeOut'] = pd.to_datetime(df['TimeOut'])
+        df['duracion_segundos'] = (df['TimeOut'] - df['TimeIn']).dt.total_seconds()
+        
+        # Contar por rango
+        for min_seg, max_seg in rangos_tiempo:
+            count = len(df[(df['duracion_segundos'] >= min_seg) & 
+                          (df['duracion_segundos'] < max_seg)])
+            resultados.loc[f'{min_seg}-{max_seg}s', horario] = count
+            
+        total = len(df)
+        promedio = df['duracion_segundos'].mean()
+        print(f'✓ {horario}: {total} txns, promedio {promedio:.2f}s')
+        
+    except Exception as e:
+        print(f'✗ Error en {horario}: {str(e)}')
+        resultados[horario] = 0
+
+# Llenar nulos y convertir a enteros
+resultados = resultados.fillna(0).astype(int)
+
+# Guardar resultado
+output_file = f'{base_path}analisis_tiempos_resultado.csv'
+resultados.to_csv(output_file)
+print(f'\n✓ Análisis completado')
+print(f'📄 Archivo guardado: {output_file}')
+
+# Resumen total por horario
+print('\n=== RESUMEN POR HORARIO ===')
+for horario in archivos_csv.keys():
+    total = resultados[horario].sum()
+    print(f'{horario}h: {total:,} transacciones')
+
+# Resumen por rango de tiempo (top 10)
+print('\n=== TOP 10 RANGOS MÁS FRECUENTES ===')
+totales_por_rango = resultados.sum(axis=1).sort_values(ascending=False).head(10)
+for rango, total in totales_por_rango.items():
+    print(f'{rango}: {total:,} transacciones')
