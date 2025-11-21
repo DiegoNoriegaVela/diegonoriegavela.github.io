@@ -1,5 +1,6 @@
-import pandas as pd
-import os
+import csv
+from datetime import datetime
+from collections import defaultdict
 
 # Rutas de tus archivos CSV
 base_path = 'C:/Users/s37841/12DDesktop/PROYECTOS/ANALISIS_TXN_PLINRESP_121112026/'
@@ -22,63 +23,90 @@ archivos_csv = {
     '21-22': f'{base_path}Resp_svr_121 2025_220143.csv',
 }
 
-# Rangos de tiempo en segundos
-rangos_tiempo = [(i, i+1) for i in range(60)]
+def calcular_segundos(time_in, time_out):
+    """Calcula la diferencia en segundos entre dos timestamps"""
+    try:
+        # Formato: 20/11/2025 19:00
+        fmt = '%d/%m/%Y %H:%M'
+        dt_in = datetime.strptime(time_in, fmt)
+        dt_out = datetime.strptime(time_out, fmt)
+        return (dt_out - dt_in).total_seconds()
+    except:
+        return None
 
-# Crear dataframe para resultados
-resultados = pd.DataFrame(
-    index=[f'{r[0]}-{r[1]}s' for r in rangos_tiempo],
-    columns=list(archivos_csv.keys())
-)
+# Inicializar resultados: {horario: {rango: contador}}
+resultados = {}
+for horario in archivos_csv.keys():
+    resultados[horario] = defaultdict(int)
+
+print('Iniciando análisis...\n')
 
 # Procesar cada archivo
-print('Iniciando análisis...\n')
 for horario, ruta_csv in archivos_csv.items():
     try:
-        if not os.path.exists(ruta_csv):
-            print(f'⚠ Archivo no encontrado: {horario}')
-            resultados[horario] = 0
-            continue
+        with open(ruta_csv, 'r', encoding='utf-8') as file:
+            reader = csv.DictReader(file)
+            total_txns = 0
+            suma_segundos = 0
             
-        # Leer CSV
-        df = pd.read_csv(ruta_csv)
-        
-        # Calcular duración en segundos
-        df['TimeIn'] = pd.to_datetime(df['TimeIn'])
-        df['TimeOut'] = pd.to_datetime(df['TimeOut'])
-        df['duracion_segundos'] = (df['TimeOut'] - df['TimeIn']).dt.total_seconds()
-        
-        # Contar por rango
-        for min_seg, max_seg in rangos_tiempo:
-            count = len(df[(df['duracion_segundos'] >= min_seg) & 
-                          (df['duracion_segundos'] < max_seg)])
-            resultados.loc[f'{min_seg}-{max_seg}s', horario] = count
+            for row in reader:
+                time_in = row.get('TimeIn', '')
+                time_out = row.get('TimeOut', '')
+                
+                segundos = calcular_segundos(time_in, time_out)
+                
+                if segundos is not None:
+                    total_txns += 1
+                    suma_segundos += segundos
+                    
+                    # Clasificar en rangos de 1 segundo
+                    if segundos < 60:
+                        rango = int(segundos)
+                        resultados[horario][rango] += 1
+                    else:
+                        # Si es mayor a 60 segundos, contar en rango 59+
+                        resultados[horario][59] += 1
             
-        total = len(df)
-        promedio = df['duracion_segundos'].mean()
-        print(f'✓ {horario}: {total} txns, promedio {promedio:.2f}s')
-        
+            promedio = suma_segundos / total_txns if total_txns > 0 else 0
+            print(f'✓ {horario}: {total_txns} txns, promedio {promedio:.2f}s')
+            
+    except FileNotFoundError:
+        print(f'⚠ Archivo no encontrado: {horario}')
     except Exception as e:
         print(f'✗ Error en {horario}: {str(e)}')
-        resultados[horario] = 0
 
-# Llenar nulos y convertir a enteros
-resultados = resultados.fillna(0).astype(int)
-
-# Guardar resultado
+# Guardar resultado en CSV
 output_file = f'{base_path}analisis_tiempos_resultado.csv'
-resultados.to_csv(output_file)
+with open(output_file, 'w', newline='', encoding='utf-8') as file:
+    writer = csv.writer(file)
+    
+    # Escribir encabezados
+    header = ['Rango'] + list(archivos_csv.keys())
+    writer.writerow(header)
+    
+    # Escribir filas (rangos de 0-1s hasta 59-60s)
+    for i in range(60):
+        fila = [f'{i}-{i+1}s']
+        for horario in archivos_csv.keys():
+            fila.append(resultados[horario][i])
+        writer.writerow(fila)
+
 print(f'\n✓ Análisis completado')
 print(f'📄 Archivo guardado: {output_file}')
 
-# Resumen total por horario
+# Resumen por horario
 print('\n=== RESUMEN POR HORARIO ===')
 for horario in archivos_csv.keys():
-    total = resultados[horario].sum()
+    total = sum(resultados[horario].values())
     print(f'{horario}h: {total:,} transacciones')
 
-# Resumen por rango de tiempo (top 10)
+# Top 10 rangos más frecuentes
 print('\n=== TOP 10 RANGOS MÁS FRECUENTES ===')
-totales_por_rango = resultados.sum(axis=1).sort_values(ascending=False).head(10)
-for rango, total in totales_por_rango.items():
-    print(f'{rango}: {total:,} transacciones')
+totales_por_rango = defaultdict(int)
+for horario_data in resultados.values():
+    for rango, count in horario_data.items():
+        totales_por_rango[rango] += count
+
+top_rangos = sorted(totales_por_rango.items(), key=lambda x: x[1], reverse=True)[:10]
+for rango, total in top_rangos:
+    print(f'{rango}-{rango+1}s: {total:,} transacciones')
