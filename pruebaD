@@ -4,9 +4,9 @@ from collections import defaultdict
 import os
 
 # --- CONFIGURACIÓN ---
-# Ajusta tu ruta aquí
 base_path = 'C:/Users/s3784112/Desktop/PROYECTOS/ANALISIS_TXN_PLIN/Resp_12112026/'
 
+# Aquí agregamos el nuevo archivo al final
 archivos_csv = {
     '06-07': f'{base_path}Resp_sw_12112025_06a07am.csv',
     '07-08': f'{base_path}Resp_sw_12112025_07a08am.csv',
@@ -24,15 +24,18 @@ archivos_csv = {
     '19-20': f'{base_path}Resp_sw_12112025_19a20.csv',
     '20-21': f'{base_path}Resp_sw_12112025_20a21.csv',
     '21-22': f'{base_path}Resp_sw_12112025_21a22.csv',
+    '22-23': f'{base_path}Resp_sw_12112025_22a23.csv', # <--- NUEVO ARCHIVO AGREGADO
 }
 
 def calcular_segundos(time_in, time_out):
     try:
+        # Limpieza de datos
         t_in = str(time_in).replace('"', '').strip()
         t_out = str(time_out).replace('"', '').strip()
         
         if not t_in or not t_out: return None
 
+        # Relleno de ceros para formato HHMMSS (ej: 75959 -> 075959)
         t_in = t_in.zfill(6)
         t_out = t_out.zfill(6)
         
@@ -42,29 +45,30 @@ def calcular_segundos(time_in, time_out):
         
         diff = (dt_out - dt_in).total_seconds()
         
+        # Ajuste por cambio de día (si pasa de 23:59 a 00:00)
         if diff < 0: diff += 86400
             
         return diff
     except:
         return None
 
-# Estructura para guardar datos
+# Estructura de resultados
 resultados = {}
 for h in archivos_csv.keys(): resultados[h] = defaultdict(int)
 
-print('Iniciando analisis y generación de matriz...\n')
+print('Iniciando analisis con nuevo intervalo 22-23...\n')
 
 # 1. PROCESAMIENTO
 for horario, ruta_csv in archivos_csv.items():
     if not os.path.exists(ruta_csv):
-        print(f'[-] Archivo no encontrado: {horario}')
+        print(f'[-] Archivo no encontrado: {horario} -> {ruta_csv}')
         continue
 
     try:
         with open(ruta_csv, 'r', encoding='utf-8-sig', errors='ignore') as file:
             reader = csv.DictReader(file)
             
-            # Limpieza de encabezados
+            # Limpieza de encabezados (quita comillas de los títulos)
             if reader.fieldnames:
                 reader.fieldnames = [h.replace('"', '').strip() for h in reader.fieldnames]
 
@@ -72,6 +76,7 @@ for horario, ruta_csv in archivos_csv.items():
             suma_segundos = 0
             
             for row in reader:
+                # Busca las columnas TIMEIN / TIMEOUT
                 time_in = row.get('TIMEIN')
                 time_out = row.get('TIMEOUT')
 
@@ -84,7 +89,7 @@ for horario, ruta_csv in archivos_csv.items():
                     if segundos < 60:
                         resultados[horario][int(segundos)] += 1
                     else:
-                        resultados[horario][59] += 1 # Agrupamos >59 en el último bucket
+                        resultados[horario][59] += 1
             
             promedio = suma_segundos / total_txns if total_txns > 0 else 0
             print(f'OK {horario}: {total_txns} txns, prom {promedio:.2f}s')
@@ -92,70 +97,58 @@ for horario, ruta_csv in archivos_csv.items():
     except Exception as e:
         print(f'Error en {horario}: {e}')
 
-# 2. GENERACIÓN DEL CSV (TABLA EXCEL) CON TOTALES
+# 2. GENERACIÓN DEL CSV (TABLA EXCEL)
 output_file = f'{base_path}REPORTE_FINAL_MATRIZ.csv'
 
 try:
     with open(output_file, 'w', newline='', encoding='utf-8') as file:
-        writer = csv.writer(file)
+        # Usamos delimiter=';' para compatibilidad con Excel español
+        writer = csv.writer(file, delimiter=';')
         
-        # --- ENCABEZADOS ---
-        # Columnas: [Rango, 06-07, 07-08, ..., TOTAL POR FILA]
+        # Encabezados: SEGUNDOS, [HORARIOS...], TOTAL FILA
         header = ['SEGUNDOS'] + list(archivos_csv.keys()) + ['TOTAL FILA']
         writer.writerow(header)
         
-        # Variables para sumar los totales de columna (verticales)
         totales_por_columna = defaultdict(int)
         gran_total_general = 0
 
-        # --- FILAS (0 a 59 segundos) ---
+        # Filas de 0 a 59 segundos
         for i in range(60):
-            # Etiqueta de la fila
-            if i == 59:
-                label = '59s o mas'
-            else:
-                label = f'{i} a {i+1} seg'
+            if i == 59: label = '59s o mas'
+            else: label = f'{i} a {i+1} seg'
             
             fila_datos = [label]
             total_fila_actual = 0
             
-            # Llenar datos de cada horario para este segundo 'i'
             for horario in archivos_csv.keys():
                 cantidad = resultados[horario][i]
                 fila_datos.append(cantidad)
                 
-                # Acumuladores
                 total_fila_actual += cantidad
                 totales_por_columna[horario] += cantidad
             
-            # Agregar el total de esta fila al final (derecha)
             fila_datos.append(total_fila_actual)
             writer.writerow(fila_datos)
             
-            # Sumar al gran total
             gran_total_general += total_fila_actual
 
-        # --- FILA FINAL DE TOTALES (INFERIOR) ---
+        # Fila de Totales Inferior
         fila_totales = ['TOTAL GENERAL']
         for horario in archivos_csv.keys():
             fila_totales.append(totales_por_columna[horario])
             
-        # El total de totales (esquina inferior derecha)
         fila_totales.append(gran_total_general)
         
-        writer.writerow([]) # Espacio en blanco
+        writer.writerow([])
         writer.writerow(fila_totales)
 
     print(f'\n[EXITO] Reporte generado: {output_file}')
-    print('Puedes abrir este archivo directamente en Excel.')
 
 except Exception as e:
     print(f'Error al guardar archivo: {e}')
 
-# 3. RESUMEN EN CONSOLA (Lo que pediste adicional)
+# 3. RESUMEN EN CONSOLA
 print('\n=== RESUMEN POR HORARIO ===')
 for horario in archivos_csv.keys():
     total = sum(resultados[horario].values())
     print(f'{horario}h: {total} transacciones')
-
-print(f'\nTOTAL ABSOLUTO PROCESADO: {gran_total_general} transacciones')
