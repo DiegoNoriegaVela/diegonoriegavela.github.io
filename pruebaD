@@ -2,25 +2,25 @@ import csv
 from datetime import datetime
 from collections import defaultdict
 
-# Rutas de tus archivos CSV
-base_path = 'C:/Users/s37841/12DDesktop/PROYECTOS/ANALISIS_TXN_PLINRESP_121112026/'
+# Rutas de tus archivos CSV - CORREGIDO: usar comillas normales
+base_path = 'C:/Users/s3784112/Desktop/PROYECTOS/ANALISIS_TXN_PLIN/Resp_12112026/'
 archivos_csv = {
-    '06-07': f'{base_path}Resp_svr_121 2025_060700mxs.csv',
-    '07-08': f'{base_path}Resp_svr_121 2025_070839mxs.csv',
-    '08-09': f'{base_path}Resp_svr_121 2025_080839mxs.csv',
-    '09-10': f'{base_path}Resp_svr_121 2025_090126mxs.csv',
-    '10-11': f'{base_path}Resp_svr_121 2025_100126mxs.csv',
-    '11-12': f'{base_path}Resp_svr_121 2025_110126mxs.csv',
-    '12-13': f'{base_path}Resp_svr_121 2025_120126mxs.csv',
-    '13-14': f'{base_path}Resp_svr_121 2025_130126mxs.csv',
-    '14-15': f'{base_path}Resp_svr_121 2025_140126mxs.csv',
-    '15-16': f'{base_path}Resp_svr_121 2025_150126mxs.csv',
-    '16-17': f'{base_path}Resp_svr_121 2025_160126mxs.csv',
-    '17-18': f'{base_path}Resp_svr_121 2025_170126mxs.csv',
-    '18-19': f'{base_path}Resp_svr_121 2025_180126mxs.csv',
-    '19-20': f'{base_path}Resp_svr_121 2025_190126mxs.csv',
-    '20-21': f'{base_path}Resp_svr_121 2025_200126mxs.csv',
-    '21-22': f'{base_path}Resp_svr_121 2025_220143.csv',
+    '06-07': f'{base_path}Resp_sw_12112025_06a07am.csv',
+    '07-08': f'{base_path}Resp_sw_12112025_07a08am.csv',
+    '08-09': f'{base_path}Resp_sw_12112025_08a09am.csv',
+    '09-10': f'{base_path}Resp_sw_12112025_09a10am.csv',
+    '10-11': f'{base_path}Resp_sw_12112025_10a11am.csv',
+    '11-12': f'{base_path}Resp_sw_12112025_11a12am.csv',
+    '12-13': f'{base_path}Resp_sw_12112025_12a13.csv',
+    '13-14': f'{base_path}Resp_sw_12112025_13a14.csv',
+    '14-15': f'{base_path}Resp_sw_12112025_14a15.csv',
+    '15-16': f'{base_path}Resp_sw_12112025_15a16.csv',
+    '16-17': f'{base_path}Resp_sw_12112025_16a17.csv',
+    '17-18': f'{base_path}Resp_sw_12112025_17a18.csv',
+    '18-19': f'{base_path}Resp_sw_12112025_18a19.csv',
+    '19-20': f'{base_path}Resp_sw_12112025_19a20.csv',
+    '20-21': f'{base_path}Resp_sw_12112025_20a21.csv',
+    '21-22': f'{base_path}Resp_sw_12112025_21a22.csv',
 }
 
 def calcular_segundos(time_in, time_out):
@@ -34,17 +34,18 @@ def calcular_segundos(time_in, time_out):
     except:
         return None
 
-# Inicializar resultados: {horario: {rango: contador}}
+# Inicializar resultados
 resultados = {}
 for horario in archivos_csv.keys():
     resultados[horario] = defaultdict(int)
 
-print('Iniciando análisis...\n')
+print('Iniciando analisis...\n')
 
 # Procesar cada archivo
 for horario, ruta_csv in archivos_csv.items():
     try:
-        with open(ruta_csv, 'r', encoding='utf-8') as file:
+        # CORREGIDO: agregar encoding y manejo de errores
+        with open(ruta_csv, 'r', encoding='utf-8-sig', errors='ignore') as file:
             reader = csv.DictReader(file)
             total_txns = 0
             suma_segundos = 0
@@ -55,58 +56,48 @@ for horario, ruta_csv in archivos_csv.items():
                 
                 segundos = calcular_segundos(time_in, time_out)
                 
-                if segundos is not None:
+                if segundos is not None and segundos >= 0:
                     total_txns += 1
                     suma_segundos += segundos
                     
-                    # Clasificar en rangos de 1 segundo
+                    # Clasificar en rangos
                     if segundos < 60:
                         rango = int(segundos)
                         resultados[horario][rango] += 1
                     else:
-                        # Si es mayor a 60 segundos, contar en rango 59+
                         resultados[horario][59] += 1
             
             promedio = suma_segundos / total_txns if total_txns > 0 else 0
-            print(f'✓ {horario}: {total_txns} txns, promedio {promedio:.2f}s')
+            print(f'OK {horario}: {total_txns} txns, promedio {promedio:.2f}s')
             
     except FileNotFoundError:
-        print(f'⚠ Archivo no encontrado: {horario}')
+        print(f'Archivo no encontrado: {horario}')
     except Exception as e:
-        print(f'✗ Error en {horario}: {str(e)}')
+        print(f'Error en {horario}: {str(e)}')
 
-# Guardar resultado en CSV
+# Guardar resultado
 output_file = f'{base_path}analisis_tiempos_resultado.csv'
-with open(output_file, 'w', newline='', encoding='utf-8') as file:
-    writer = csv.writer(file)
+try:
+    with open(output_file, 'w', newline='', encoding='utf-8') as file:
+        writer = csv.writer(file)
+        
+        # Encabezados
+        header = ['Rango'] + list(archivos_csv.keys())
+        writer.writerow(header)
+        
+        # Filas
+        for i in range(60):
+            fila = [f'{i}-{i+1}s']
+            for horario in archivos_csv.keys():
+                fila.append(resultados[horario][i])
+            writer.writerow(fila)
     
-    # Escribir encabezados
-    header = ['Rango'] + list(archivos_csv.keys())
-    writer.writerow(header)
-    
-    # Escribir filas (rangos de 0-1s hasta 59-60s)
-    for i in range(60):
-        fila = [f'{i}-{i+1}s']
-        for horario in archivos_csv.keys():
-            fila.append(resultados[horario][i])
-        writer.writerow(fila)
+    print(f'\nArchivo guardado: {output_file}')
+except Exception as e:
+    print(f'Error al guardar: {str(e)}')
 
-print(f'\n✓ Análisis completado')
-print(f'📄 Archivo guardado: {output_file}')
-
-# Resumen por horario
+# Resumen
 print('\n=== RESUMEN POR HORARIO ===')
 for horario in archivos_csv.keys():
     total = sum(resultados[horario].values())
-    print(f'{horario}h: {total:,} transacciones')
-
-# Top 10 rangos más frecuentes
-print('\n=== TOP 10 RANGOS MÁS FRECUENTES ===')
-totales_por_rango = defaultdict(int)
-for horario_data in resultados.values():
-    for rango, count in horario_data.items():
-        totales_por_rango[rango] += count
-
-top_rangos = sorted(totales_por_rango.items(), key=lambda x: x[1], reverse=True)[:10]
-for rango, total in top_rangos:
-    print(f'{rango}-{rango+1}s: {total:,} transacciones')
+    print(f'{horario}h: {total} transacciones')
