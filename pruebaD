@@ -1,9 +1,12 @@
 import csv
 from datetime import datetime
 from collections import defaultdict
+import os
 
-# Rutas de tus archivos CSV - CORREGIDO: usar comillas normales
+# --- CONFIGURACIÓN ---
+# Ajusta esta ruta si es necesario
 base_path = 'C:/Users/s3784112/Desktop/PROYECTOS/ANALISIS_TXN_PLIN/Resp_12112026/'
+
 archivos_csv = {
     '06-07': f'{base_path}Resp_sw_12112025_06a07am.csv',
     '07-08': f'{base_path}Resp_sw_12112025_07a08am.csv',
@@ -24,14 +27,40 @@ archivos_csv = {
 }
 
 def calcular_segundos(time_in, time_out):
-    """Calcula la diferencia en segundos entre dos timestamps"""
+    """
+    Calcula segundos basado en formato compacto HHMMSS.
+    Ejemplo CSV: "65959" -> 06:59:59
+    """
     try:
-        # Formato: 20/11/2025 19:00
-        fmt = '%d/%m/%Y %H:%M'
-        dt_in = datetime.strptime(time_in, fmt)
-        dt_out = datetime.strptime(time_out, fmt)
-        return (dt_out - dt_in).total_seconds()
-    except:
+        # Limpiar comillas si vienen en el string
+        t_in = time_in.replace('"', '').strip()
+        t_out = time_out.replace('"', '').strip()
+        
+        # Si están vacíos, retornar None
+        if not t_in or not t_out:
+            return None
+
+        # Rellenar con ceros a la izquierda si falta (ej: 65959 -> 065959)
+        t_in = t_in.zfill(6)
+        t_out = t_out.zfill(6)
+        
+        # Parsear formato HHMMSS
+        fmt = '%H%M%S'
+        dt_in = datetime.strptime(t_in, fmt)
+        dt_out = datetime.strptime(t_out, fmt)
+        
+        # Calcular diferencia
+        diff = (dt_out - dt_in).total_seconds()
+        
+        # Manejo de cambio de día (si out es menor que in, sumamos 24h)
+        if diff < 0:
+            diff += 86400
+            
+        return diff
+    except ValueError:
+        # Si el formato no es número válido
+        return None
+    except Exception as e:
         return None
 
 # Inicializar resultados
@@ -43,17 +72,32 @@ print('Iniciando analisis...\n')
 
 # Procesar cada archivo
 for horario, ruta_csv in archivos_csv.items():
+    # Verificar si existe antes de abrir para evitar crash
+    if not os.path.exists(ruta_csv):
+        print(f'Archivo no encontrado: {horario} -> {ruta_csv}')
+        continue
+
     try:
-        # CORREGIDO: agregar encoding y manejo de errores
+        # Usamos utf-8-sig para quitar el BOM si existe
         with open(ruta_csv, 'r', encoding='utf-8-sig', errors='ignore') as file:
+            # csv.DictReader leerá la primera fila como encabezados
             reader = csv.DictReader(file)
+            
+            # Normalizamos los nombres de campo (strip de espacios por si acaso)
+            reader.fieldnames = [name.strip().replace('"', '') for name in reader.fieldnames]
+
             total_txns = 0
             suma_segundos = 0
             
             for row in reader:
-                time_in = row.get('TimeIn', '')
-                time_out = row.get('TimeOut', '')
+                # CORRECCIÓN AQUÍ: Usar mayúsculas como en tu CSV
+                time_in = row.get('TIMEIN', '')
+                time_out = row.get('TIMEOUT', '')
                 
+                # Fallback por si el CSV usa otro casing
+                if not time_in: time_in = row.get('TimeIn', '')
+                if not time_out: time_out = row.get('TimeOut', '')
+
                 segundos = calcular_segundos(time_in, time_out)
                 
                 if segundos is not None and segundos >= 0:
@@ -65,15 +109,14 @@ for horario, ruta_csv in archivos_csv.items():
                         rango = int(segundos)
                         resultados[horario][rango] += 1
                     else:
+                        # Todo lo mayor a 1 min va al bucket 59
                         resultados[horario][59] += 1
             
             promedio = suma_segundos / total_txns if total_txns > 0 else 0
             print(f'OK {horario}: {total_txns} txns, promedio {promedio:.2f}s')
             
-    except FileNotFoundError:
-        print(f'Archivo no encontrado: {horario}')
     except Exception as e:
-        print(f'Error en {horario}: {str(e)}')
+        print(f'Error procesando {horario}: {str(e)}')
 
 # Guardar resultado
 output_file = f'{base_path}analisis_tiempos_resultado.csv'
@@ -85,18 +128,23 @@ try:
         header = ['Rango'] + list(archivos_csv.keys())
         writer.writerow(header)
         
-        # Filas
+        # Filas del 0 al 59
         for i in range(60):
-            fila = [f'{i}-{i+1}s']
+            if i == 59:
+                etiqueta = '>59s'
+            else:
+                etiqueta = f'{i}-{i+1}s'
+                
+            fila = [etiqueta]
             for horario in archivos_csv.keys():
                 fila.append(resultados[horario][i])
             writer.writerow(fila)
     
-    print(f'\nArchivo guardado: {output_file}')
+    print(f'\nArchivo guardado exitosamente: {output_file}')
 except Exception as e:
-    print(f'Error al guardar: {str(e)}')
+    print(f'Error al guardar archivo final: {str(e)}')
 
-# Resumen
+# Resumen final en consola
 print('\n=== RESUMEN POR HORARIO ===')
 for horario in archivos_csv.keys():
     total = sum(resultados[horario].values())
