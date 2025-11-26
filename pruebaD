@@ -3,7 +3,8 @@ set -eou pipefail
 
 # ==============================================================================
 # SCRIPT: cryptCbcToPgp.sh
-# DESCRIPCION: Descarga llaves, desencripta AES-CBC, encripta PGP y mueve a NFS.
+# DESCRIPCION: Descarga llaves via SFTP, desencripta AES-CBC, encripta PGP y mueve a NFS.
+#              Verifica conexion y ruta remota antes de la transferencia.
 # ==============================================================================
 
 # 1. Obtener directorio local absoluto donde reside el script (PWD dinamico)
@@ -17,209 +18,218 @@ if [ ! -f "$CONFIG_FILE" ]; then
     exit 1
 fi
 
+# Carga las variables del archivo .ini
+# shellcheck source=config.ini
 source "$CONFIG_FILE"
 
 # 3. Definicion de variables derivadas y fecha
-# Formato AAMMDD (Ej: 251126)
+# Formato AAMMDD (Ej: 251126) para nombres de archivo
 DATE_YYMMDD=$(date +'%y%m%d')
 
-# Rutas de trabajo
+# Rutas de trabajo internas
+DIR_TMP="${DIR_LOCAL}/tmp"
 DIR_OUT_LOCAL="${DIR_LOCAL}/OUT"
 
-# Archivos
-FILE_LOCAL_IFS="${DIR_LOCAL}/${TEMP_PROP_FILE}"
-DEC_FILE="${DIR_LOCAL}/${TEMP_DEC_FILE}"
+# Archivos temporales
+FILE_LOCAL_IFS="${DIR_TMP}/${TEMP_PROP_FILE}"
+DEC_FILE="${DIR_TMP}/${TEMP_DEC_FILE}"
 IN_ENC_FILE="${DIR_LOCAL}/${INPUT_ENC_FILE}"
 
-# Nombres de Salida Finales
+# Nombres de Archivos de Salida Finales
 FINAL_PGP_NAME="${OUTPUT_FILENAME_PREFIX}${DATE_YYMMDD}.txt.pgp"
 FINAL_CTL_NAME="${OUTPUT_CONTROL_PREFIX}${DATE_YYMMDD}.fin"
 
+# Rutas completas de los archivos de salida locales
 OUT_PGP_FILE="${DIR_OUT_LOCAL}/${FINAL_PGP_NAME}"
 OUT_CONTROL_FILE="${DIR_OUT_LOCAL}/${FINAL_CTL_NAME}"
 
-# Variables globales para KEY e IV
-KEY_AES=""
-IV_AES=""
-
-# Crear directorios necesarios si no existen
-mkdir -p "$DIR_OUT_LOCAL"
+# Crear directorios locales necesarios si no existen
+mkdir -p "$DIR_TMP" "$DIR_OUT_LOCAL"
 
 # ==============================================================================
 # FUNCIONES
 # ==============================================================================
 
-verificar_sftp() {
-    echo "Inicio verificacion conexion SFTP con ${SFTP_IP}..."
+log() {
+    # Funcion para imprimir en pantalla con timestamp. Lee del stdin.
+    # No guarda en archivo log.
+    while IFS= read -r line; do
+        echo "$(date +'%Y-%m-%d %H:%M:%S') - $line"
+    done
+}
 
-    # Probar conexion SFTP
-    sftp -i "$SFTP_KEY" -oBatchMode=yes -oConnectTimeout=5 -oStrictHostKeyChecking=no "${SFTP_USER}@${SFTP_IP}" <<EOF
+get_as400() {
+    echo "Inicio proceso SFTP desde ${SFTP_IP}..."
+
+    # 1. Probar conexion SFTP basica con timeout corto (5 segundos)
+    echo "Probando conexion SFTP..."
+    if ! sftp -i "$SFTP_KEY" -oBatchMode=yes -oConnectTimeout=5 -oStrictHostKeyChecking=no "${SFTP_USER}@${SFTP_IP}" <<EOF >/dev/null 2>&1
 exit
 EOF
-
-    if [ $? -ne 0 ]; then
-        echo "Error: No se pudo establecer conexion SFTP con ${SFTP_IP}"
+    then
+        echo "Error: No se pudo establecer conexion SFTP con ${SFTP_IP}. Verifique red o credenciales."
         return 1
     fi
+    echo "Conexion SFTP establecida correctamente."
 
-    # Verificar si la ruta remota existe
-    echo "Se verifica ruta remota..."
-    VERIF_REMOTE=$(sftp -i "$SFTP_KEY" "${SFTP_USER}@${SFTP_IP}" 2>&1 <<EOF
+    # 2. Verificar si la ruta remota existe antes de intentar descargar
+    echo "Verificando existencia de ruta remota: $REMOTE_DIR_AS400 ..."
+    # Capturamos la salida y errores del comando SFTP al intentar hacer 'cd'
+    VERIF_REMOTE=$(sftp -i "$SFTP_KEY" -oBatchMode=yes -oStrictHostKeyChecking=no "${SFTP_USER}@${SFTP_IP}" 2>&1 <<EOF
 cd $REMOTE_DIR_AS400
 exit
 EOF
 )
-    
-    if echo "$VERIF_REMOTE" | grep -Eqi "No such file|failed"; then
-        echo "Error: El directorio remoto $REMOTE_DIR_AS400 no existe en el servidor SFTP ${SFTP_IP}"
+
+    # Buscamos el mensaje de error "No such file" en la salida capturada
+    if echo "$VERIF_REMOTE" | grep -Eqi "No such file|not found"; then
+        echo "Error: El directorio remoto '$REMOTE_DIR_AS400' no existe en el servidor SFTP."
         return 1
     fi
-    
-    echo "Conexion y ruta remota verificadas correctamente."
-}
+    echo "Ruta remota verificada correctamente."
 
-get_as400() {
-    echo "Inicio SFTP GET desde ${SFTP_IP}..."
-
-    # Ejecutar transferencia SFTP
-    sftp -i "$SFTP_KEY" -oBatchMode=yes -oConnectTimeout=10 -oStrictHostKeyChecking=no "${SFTP_USER}@${SFTP_IP}" <<EOF
-lcd $DIR_LOCAL
+    # 3. Ejecutar transferencia SFTP (Descarga del archivo)
+    echo "Ejecutando transferencia SFTP del archivo de propiedades..."
+    if sftp -i "$SFTP_KEY" -oBatchMode=yes -oConnectTimeout=10 -oStrictHostKeyChecking=no "${SFTP_USER}@${SFTP_IP}" <<EOF
+lcd $DIR_TMP
 cd $REMOTE_DIR_AS400
 get $REMOTE_FILE_AS400
 bye
 EOF
-    
-    if [ $? -ne 0 ]; then
-        echo "Error: Fallo la transferencia SFTP desde $SFTP_IP"
+    then
+        echo "Descarga SFTP exitosa en: $DIR_TMP"
+    else
+        echo "Error: Fallo la transferencia del archivo $REMOTE_FILE_AS400 desde $SFTP_IP"
         return 1
     fi
-
-    echo "Descarga SFTP exitosa en: $DIR_LOCAL"
 }
 
 obtener_key_iv() {
-    echo "Inicio obtencion de KEY e IV desde propiedades..."
-    
+    echo "Inicio obtencion de KEY e IV desde archivo de propiedades descargado..."
+
     if [ ! -f "$FILE_LOCAL_IFS" ]; then
-        echo "Error: No existe el archivo de propiedades $FILE_LOCAL_IFS"
+        echo "Error: No existe el archivo de propiedades $FILE_LOCAL_IFS en el directorio temporal."
         return 1
     fi
 
-    # Extrae linea 1 (Key) y linea 2 (IV) limpiando saltos de linea y retornos
+    # Extrae linea 1 (Key) y linea 2 (IV) limpiando saltos de linea y retornos de carro
+    # Se asume que el archivo contiene solo el string HEX de la llave y el IV en lineas separadas.
     KEY_AES=$(sed -n '1p' "$FILE_LOCAL_IFS" | tr -d '\n\r ')
     IV_AES=$(sed -n '2p' "$FILE_LOCAL_IFS" | tr -d '\n\r ')
 
     # Validacion simple de que no esten vacios
     if [ -z "$KEY_AES" ] || [ -z "$IV_AES" ]; then
-        echo "Error: La KEY o el IV estan vacios."
+        echo "Error: La KEY o el IV extraidos estan vacios. Verifique el archivo de propiedades."
         return 1
     fi
 
-    echo "KEY e IV obtenidos correctamente."
+    echo "KEY e IV obtenidos correctamente de forma interna."
 }
 
 desencriptar_archivo() {
-    echo "Inicio desencriptado CBC AES..."
-    
+    echo "Inicio proceso de desencriptado CBC AES..."
+
     if [ ! -f "$IN_ENC_FILE" ]; then
-        echo "Error: No existe el archivo encriptado entrada: $IN_ENC_FILE"
+        echo "Error: No existe el archivo encriptado de entrada: $IN_ENC_FILE"
         return 1
     fi
 
-    # Se usa -K mayuscula para llave hexadecimal
+    # Se usa -K (mayuscula) para indicar que la llave esta en formato HEX.
+    # Si fuera una contraseña de texto plano, se usaria -k (minuscula).
     openssl enc -d -aes-256-cbc -K "$KEY_AES" -iv "$IV_AES" -in "$IN_ENC_FILE" -out "$DEC_FILE"
-    
+
     if [ $? -eq 0 ]; then
-        echo "Fin de desencriptado. Archivo generado: $DEC_FILE"
+        echo "Fin de desencriptado AES. Archivo intermedio generado: $DEC_FILE"
     else
-        echo "Error: Fallo el comando openssl."
+        echo "Error: Fallo el comando openssl durante el desencriptado."
         return 1
     fi
 }
 
 encriptar_archivo_pgp() {
-    echo "Inicio encriptado PGP..."
-    
-    # Se usa --always-trust para evitar fallos si la llave no esta firmada localmente
+    echo "Inicio proceso de encriptado PGP..."
+
+    # Se usa --always-trust para evitar fallos si la llave publica no esta firmada localmente.
     "$PGP_BIN" --encrypt --recipient "$PGP_RECIPIENT" --input "$DEC_FILE" --output "$OUT_PGP_FILE" --always-trust
-    
+
     if [ $? -eq 0 ]; then
-        echo "Fin de encriptado PGP. Archivo: $OUT_PGP_FILE"
+        echo "Fin de encriptado PGP. Archivo generado: $OUT_PGP_FILE"
     else
-        echo "Error: Fallo encriptacion PGP."
+        echo "Error: Fallo el proceso de encriptacion PGP."
         return 1
     fi
 }
 
 genera_control() {
     echo "Generando archivo de control..."
-    # Cuenta lineas del archivo desencriptado
+    # Cuenta lineas del archivo desencriptado (datos crudos)
     local count
     count=$(wc -l < "$DEC_FILE")
-    # Limpia espacios en blanco del wc
+    # Limpia espacios en blanco alrededor del numero obtenido por wc
     count=$(echo "$count" | xargs)
-    
+
     echo "Registros: $count" > "$OUT_CONTROL_FILE"
-    echo "Archivo de control generado: $OUT_CONTROL_FILE"
+    echo "Archivo de control generado: $OUT_CONTROL_FILE con $count registros."
 }
 
 transferir_y_limpiar_nfs() {
-    echo "Iniciando transferencia a NFS: $PATH_NFS_OUT"
+    echo "Iniciando proceso de transferencia a directorio NFS: $PATH_NFS_OUT"
 
-    # Verificar que el directorio NFS existe y es escribible
+    # Verificar que el directorio NFS destino existe localmente y es accesible
     if [ ! -d "$PATH_NFS_OUT" ]; then
-        echo "Error: El directorio NFS $PATH_NFS_OUT no existe o no es accesible."
+        echo "Error: El directorio NFS destino $PATH_NFS_OUT no existe o no es accesible desde este servidor."
         return 1
     fi
 
-    # 1. Limpiar directorio NFS destino
-    echo "Limpiando directorio destino NFS..."
-    # Usamos precaucion: solo borrar archivos dentro del path especifico
-    # rm -f "${PATH_NFS_OUT:?}/"* <-- La sintaxis :? evita borrar si la variable esta vacia
-    rm -f "${PATH_NFS_OUT}"/*
-    
-    # 2. Copiar archivos nuevos
-    echo "Copiando archivos a NFS..."
+    # 1. Limpiar directorio NFS destino antes de copiar
+    echo "Limpiando contenido actual del directorio destino NFS..."
+    # ATENCION: Esto borra TODO el contenido en la carpeta especificada en PATH_NFS_OUT.
+    # El uso de :? es una medida de seguridad para evitar borrar la raiz si la variable estuviera vacia.
+    rm -f "${PATH_NFS_OUT:?}"/*
+
+    # 2. Copiar los nuevos archivos generados
+    echo "Copiando archivos PGP y de Control al NFS..."
     cp "$OUT_PGP_FILE" "$PATH_NFS_OUT"
     cp "$OUT_CONTROL_FILE" "$PATH_NFS_OUT"
 
     if [ $? -eq 0 ]; then
         echo "Transferencia a NFS completada exitosamente."
     else
-        echo "Error al copiar archivos al NFS."
+        echo "Error critical: Fallo al copiar los archivos al directorio NFS."
         return 1
     fi
 }
 
 limpiar_temporales() {
-    echo "Eliminando archivos temporales..."
-    rm -f "$FILE_LOCAL_IFS" "$DEC_FILE"
+    # Borra la carpeta temporal y su contenido para no dejar rastros de las llaves o datos desencriptados.
+    echo "Eliminando directorio temporal de trabajo: $DIR_TMP"
+    rm -rf "$DIR_TMP"
 }
 
 # ==============================================================================
-# MAIN
+# FUNCION PRINCIPAL (MAIN)
 # ==============================================================================
 
 main() {
-    echo "=== INICIO DE RUTINA SERVIDOR $(hostname) ==="
-    
-    # Ejecucion paso a paso
-    verificar_sftp
+    echo "=== INICIO DE RUTINA EN SERVIDOR $(hostname) ==="
+
+    # Ejecucion secuencial paso a paso.
+    # Si algun paso falla, el script se detendra gracias a 'set -e'.
     get_as400
     obtener_key_iv
     desencriptar_archivo
     encriptar_archivo_pgp
     genera_control
-    
-    # Paso especial NFS
+
+    # Paso final: mover archivos al NFS y limpiar destino previo
     transferir_y_limpiar_nfs
 
-    # Limpieza final
+    # Limpieza de seguridad de archivos temporales locales
     limpiar_temporales
 
     echo "=== FIN DE RUTINA EXITOSO ==="
 }
 
-# Ejecutar Main y redirigir errores a la salida estandar
-main 2>&1
-
+# Ejecutar la funcion principal y redirigir su salida estandar y de error a la funcion de log.
+# Esto asegura que todo lo que se imprima tenga el formato de fecha y hora en pantalla.
+main 2>&1 | log
