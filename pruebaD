@@ -1,53 +1,17 @@
-# ==========================================
-# CONFIGURACION DEL PROCESO CRYPT CBC TO PGP
-# ==========================================
-
-# --- Rutas Locales y Binarios ---
-PGP_BIN="/opt/pgp/bin/pgp"
-PATH_NFS_OUT="/nfshomedesa/usftp138/OUT/"
-
-# --- Credenciales SFTP AS400 (Comunes) ---
-SFTP_USER="usddsad"
-SFTP_IP="10.10.10.10"
-SFTP_KEY="/home/usddsad/.ssh/id_rsa"
-
-# --- 1. Configuracion Archivo de PROPIEDADES (Llaves) ---
-# Ruta y archivo remoto para obtener KEY e IV
-REMOTE_DIR_PROPS="/Cifrado_OPENSSL/EPM/Project/properties"
-REMOTE_FILE_PROPS="props.properties"
-
-# --- 2. Configuracion Archivo de DATOS (Input Encriptado) ---
-# Ruta remota donde esta el archivo .enc que vamos a procesar
-REMOTE_DIR_INPUT="/home/usddsad/input_files/encrypted"
-REMOTE_FILE_INPUT="LTAX1451.enc"
-
-# --- Configuracion PGP (Salida) ---
-PGP_RECIPIENT="seginfo@izipay.pe"
-OUTPUT_FILENAME_PREFIX="LTAX1451"
-OUTPUT_CONTROL_PREFIX="ECTRL10925"
-
-# --- Nombres de archivos temporales (Interno) ---
-# Nombres con los que se guardaran en la carpeta tmp local
-TEMP_PROP_FILE="props.properties"
-TEMP_DEC_FILE="LTAX1451.txt"
-
-
----
-
 #!/bin/bash
 set -eou pipefail
 
 # ==============================================================================
 # SCRIPT: cryptCbcToPgp.sh
-# DESCRIPCION: 1. Descarga llaves (props) via SFTP.
-#              2. Descarga archivo encriptado via SFTP.
+# DESCRIPCION: 1. Prepara entorno local (crea carpetas si no existen).
+#              2. Descarga llaves y archivo encriptado del AS400.
 #              3. Desencripta AES-CBC, encripta PGP y mueve a NFS.
 # ==============================================================================
 
 # 1. Obtener directorio local absoluto
 DIR_LOCAL="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 
-# 2. Cargar archivo de configuracion
+# 2. Cargar configuracion
 CONFIG_FILE="${DIR_LOCAL}/config.ini"
 
 if [ ! -f "$CONFIG_FILE" ]; then
@@ -61,15 +25,13 @@ source "$CONFIG_FILE"
 # 3. Definicion de variables y rutas
 DATE_YYMMDD=$(date +'%y%m%d')
 
-# Rutas de trabajo internas
+# Rutas de trabajo internas (Estas se crearan automaticamente)
 DIR_TMP="${DIR_LOCAL}/tmp"
 DIR_OUT_LOCAL="${DIR_LOCAL}/OUT"
 
-# Archivos temporales (Localmente todos estaran en tmp)
+# Archivos
 FILE_LOCAL_IFS="${DIR_TMP}/${TEMP_PROP_FILE}"
 DEC_FILE="${DIR_TMP}/${TEMP_DEC_FILE}"
-
-# AHORA: El archivo encriptado tambien estara en TMP tras la descarga
 IN_ENC_FILE="${DIR_TMP}/${REMOTE_FILE_INPUT}"
 
 # Nombres de Salida Finales
@@ -78,9 +40,6 @@ FINAL_CTL_NAME="${OUTPUT_CONTROL_PREFIX}${DATE_YYMMDD}.fin"
 
 OUT_PGP_FILE="${DIR_OUT_LOCAL}/${FINAL_PGP_NAME}"
 OUT_CONTROL_FILE="${DIR_OUT_LOCAL}/${FINAL_CTL_NAME}"
-
-# Crear directorios
-mkdir -p "$DIR_TMP" "$DIR_OUT_LOCAL"
 
 # ==============================================================================
 # FUNCIONES
@@ -92,7 +51,19 @@ log() {
     done
 }
 
-# Funcion generica para verificar si existe un directorio remoto
+preparar_entorno_local() {
+    echo "--- PASO 0: Preparacion del entorno local ---"
+    
+    # Creamos directorios locales. 
+    # mkdir -p crea la carpeta si no existe, y no da error si ya existe.
+    if mkdir -p "$DIR_TMP" "$DIR_OUT_LOCAL"; then
+        echo "Directorios locales verificados: $DIR_TMP y $DIR_OUT_LOCAL"
+    else
+        echo "Error: No se pudieron crear los directorios locales. Verifique permisos."
+        return 1
+    fi
+}
+
 check_remote_dir() {
     local dir_to_check="$1"
     echo "Verificando existencia de ruta remota: $dir_to_check ..."
@@ -112,7 +83,6 @@ EOF
 get_props_as400() {
     echo "--- PASO 1: Obtener Archivo de Propiedades (Llaves) ---"
 
-    # Verificar conexion y existencia de ruta de propiedades
     check_remote_dir "$REMOTE_DIR_PROPS"
 
     echo "Descargando propiedades..."
@@ -133,7 +103,6 @@ EOF
 get_input_file_as400() {
     echo "--- PASO 2: Obtener Archivo Encriptado (Input) ---"
     
-    # Verificar existencia de ruta de datos (Input)
     check_remote_dir "$REMOTE_DIR_INPUT"
 
     echo "Descargando archivo de datos encriptado..."
@@ -144,7 +113,7 @@ get $REMOTE_FILE_INPUT
 bye
 EOF
     then
-        echo "Archivo de datos ($REMOTE_FILE_INPUT) descargado exitosamente en TMP."
+        echo "Archivo de datos descargado exitosamente en TMP."
     else
         echo "Error: Fallo la descarga del archivo de datos $REMOTE_FILE_INPUT"
         return 1
@@ -190,6 +159,12 @@ desencriptar_archivo() {
 encriptar_archivo_pgp() {
     echo "--- PASO 5: Encriptado PGP ---"
 
+    # Verificacion basica de existencia del binario PGP (ya que no lo podemos crear)
+    if [ ! -x "$PGP_BIN" ]; then
+        echo "Error: El ejecutable PGP no existe o no tiene permisos: $PGP_BIN"
+        return 1
+    fi
+
     "$PGP_BIN" --encrypt --recipient "$PGP_RECIPIENT" --input "$DEC_FILE" --output "$OUT_PGP_FILE" --always-trust
 
     if [ $? -eq 0 ]; then
@@ -206,12 +181,13 @@ genera_control() {
     count=$(wc -l < "$DEC_FILE")
     count=$(echo "$count" | xargs)
     echo "Registros: $count" > "$OUT_CONTROL_FILE"
-    echo "Control generado con $count registros."
+    echo "Control generado."
 }
 
 transferir_y_limpiar_nfs() {
     echo "--- PASO 7: Transferencia a NFS ---"
 
+    # Verificamos carpeta NFS (No la podemos crear, debe existir)
     if [ ! -d "$PATH_NFS_OUT" ]; then
         echo "Error: Directorio NFS no accesible: $PATH_NFS_OUT"
         return 1
@@ -244,15 +220,17 @@ limpiar_temporales() {
 main() {
     echo "=== INICIO PROCESO EN $(hostname) ==="
 
-    # Secuencia de pasos
-    get_props_as400        # Descarga llaves
-    get_input_file_as400   # Descarga el archivo .enc (NUEVO PASO)
-    obtener_key_iv         # Lee las llaves
-    desencriptar_archivo   # Desencripta el archivo descargado
-    encriptar_archivo_pgp  # Encripta a PGP
-    genera_control         # Crea archivo control
-    transferir_y_limpiar_nfs # Mueve a NFS
-    limpiar_temporales     # Borra temporales
+    preparar_entorno_local # <--- AQUI SE CREAN TMP Y OUT SI NO EXISTEN
+    
+    get_props_as400
+    get_input_file_as400
+    obtener_key_iv
+    desencriptar_archivo
+    encriptar_archivo_pgp
+    genera_control
+    transferir_y_limpiar_nfs
+    
+    limpiar_temporales
 
     echo "=== FIN PROCESO EXITOSO ==="
 }
