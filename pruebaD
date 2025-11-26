@@ -1,154 +1,239 @@
-import csv
-from datetime import datetime
-from collections import defaultdict
-import os
+#!/bin/bash
+set -eou pipefail
 
-# --- CONFIGURACIÓN ---
-base_path = 'C:/Users/s3784112/Desktop/PROYECTOS/ANALISIS_TXN_PLIN/Resp_12112026/'
+# ==============================================================================
+# SCRIPT: cryptCbcToPgp.sh
+# DESCRIPCION: Descarga llaves, desencripta AES-CBC, encripta PGP y mueve a NFS.
+# ==============================================================================
 
-# Aquí agregamos el nuevo archivo al final
-archivos_csv = {
-    '06-07': f'{base_path}Resp_sw_12112025_06a07am.csv',
-    '07-08': f'{base_path}Resp_sw_12112025_07a08am.csv',
-    '08-09': f'{base_path}Resp_sw_12112025_08a09am.csv',
-    '09-10': f'{base_path}Resp_sw_12112025_09a10am.csv',
-    '10-11': f'{base_path}Resp_sw_12112025_10a11am.csv',
-    '11-12': f'{base_path}Resp_sw_12112025_11a12am.csv',
-    '12-13': f'{base_path}Resp_sw_12112025_12a13.csv',
-    '13-14': f'{base_path}Resp_sw_12112025_13a14.csv',
-    '14-15': f'{base_path}Resp_sw_12112025_14a15.csv',
-    '15-16': f'{base_path}Resp_sw_12112025_15a16.csv',
-    '16-17': f'{base_path}Resp_sw_12112025_16a17.csv',
-    '17-18': f'{base_path}Resp_sw_12112025_17a18.csv',
-    '18-19': f'{base_path}Resp_sw_12112025_18a19.csv',
-    '19-20': f'{base_path}Resp_sw_12112025_19a20.csv',
-    '20-21': f'{base_path}Resp_sw_12112025_20a21.csv',
-    '21-22': f'{base_path}Resp_sw_12112025_21a22.csv',
-    '22-23': f'{base_path}Resp_sw_12112025_22a23.csv', # <--- NUEVO ARCHIVO AGREGADO
+# 1. Obtener directorio local absoluto donde reside el script (PWD dinámico)
+DIR_LOCAL="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
+
+# 2. Cargar archivo de configuración
+CONFIG_FILE="${DIR_LOCAL}/config.ini"
+
+if [ ! -f "$CONFIG_FILE" ]; then
+    echo "Error: No se encuentra el archivo de configuración $CONFIG_FILE"
+    exit 1
+fi
+
+source "$CONFIG_FILE"
+
+# 3. Definicion de variables derivadas y fecha
+# Formato AAMMDD (Ej: 251126)
+DATE_YYMMDD=$(date +'%y%m%d')
+TIMESTAMP=$(date +'%Y-%m-%d %H:%M:%S')
+
+# Rutas de trabajo
+DIR_TMP="${DIR_LOCAL}/tmp"
+DIR_LOGS="${DIR_LOCAL}/logs"
+DIR_OUT_LOCAL="${DIR_LOCAL}/OUT"
+
+# Archivos
+LOG_FILE="${DIR_LOGS}/proceso_${DATE_YYMMDD}.log"
+FILE_LOCAL_IFS="${DIR_TMP}/${TEMP_PROP_FILE}"
+DEC_FILE="${DIR_TMP}/${TEMP_DEC_FILE}"
+IN_ENC_FILE="${DIR_LOCAL}/${INPUT_ENC_FILE}"
+
+# Nombres de Salida Finales
+FINAL_PGP_NAME="${OUTPUT_FILENAME_PREFIX}${DATE_YYMMDD}.txt.pgp"
+FINAL_CTL_NAME="${OUTPUT_CONTROL_PREFIX}${DATE_YYMMDD}.fin"
+
+OUT_PGP_FILE="${DIR_OUT_LOCAL}/${FINAL_PGP_NAME}"
+OUT_CONTROL_FILE="${DIR_OUT_LOCAL}/${FINAL_CTL_NAME}"
+
+# Crear directorios necesarios si no existen
+mkdir -p "$DIR_TMP" "$DIR_LOGS" "$DIR_OUT_LOCAL"
+
+# ==============================================================================
+# FUNCIONES
+# ==============================================================================
+
+log() {
+    # Función para loguear con timestamp, lee del stdin
+    while IFS= read -r line; do
+        echo "$(date +'%Y-%m-%d %H:%M:%S') - $line"
+        echo "$(date +'%Y-%m-%d %H:%M:%S') - $line" >> "$LOG_FILE"
+    done
 }
 
-def calcular_segundos(time_in, time_out):
-    try:
-        # Limpieza de datos
-        t_in = str(time_in).replace('"', '').strip()
-        t_out = str(time_out).replace('"', '').strip()
-        
-        if not t_in or not t_out: return None
+get_as400() {
+    echo "Inicio SFTP GET desde ${SFTP_IP}..."
 
-        # Relleno de ceros para formato HHMMSS (ej: 75959 -> 075959)
-        t_in = t_in.zfill(6)
-        t_out = t_out.zfill(6)
-        
-        fmt = '%H%M%S'
-        dt_in = datetime.strptime(t_in, fmt)
-        dt_out = datetime.strptime(t_out, fmt)
-        
-        diff = (dt_out - dt_in).total_seconds()
-        
-        # Ajuste por cambio de día (si pasa de 23:59 a 00:00)
-        if diff < 0: diff += 86400
-            
-        return diff
-    except:
-        return None
+    # Verificar conectividad básica (opcional, pero recomendado)
+    # echo "Probando conexión..."
 
-# Estructura de resultados
-resultados = {}
-for h in archivos_csv.keys(): resultados[h] = defaultdict(int)
+    # Ejecutar SFTP
+    # Usamos StrictHostKeyChecking=no para evitar prompts interactivos si cambia la fingerprint
+    if sftp -i "$SFTP_KEY" -oBatchMode=yes -oConnectTimeout=10 -oStrictHostKeyChecking=no "${SFTP_USER}@${SFTP_IP}" <<EOF
+lcd $DIR_TMP
+cd $REMOTE_DIR_AS400
+get $REMOTE_FILE_AS400
+bye
+EOF
+    then
+        echo "Descarga SFTP exitosa en: $DIR_TMP"
+    else
+        echo "Error: Fallo la transferencia SFTP desde $SFTP_IP"
+        return 1
+    fi
+}
 
-print('Iniciando analisis con nuevo intervalo 22-23...\n')
+obtener_key_iv() {
+    echo "Inicio obtención de KEY e IV desde propiedades..."
+    
+    if [ ! -f "$FILE_LOCAL_IFS" ]; then
+        echo "Error: No existe el archivo de propiedades $FILE_LOCAL_IFS"
+        return 1
+    fi
 
-# 1. PROCESAMIENTO
-for horario, ruta_csv in archivos_csv.items():
-    if not os.path.exists(ruta_csv):
-        print(f'[-] Archivo no encontrado: {horario} -> {ruta_csv}')
-        continue
+    # Extrae linea 1 (Key) y linea 2 (IV) limpiando saltos de linea y retornos
+    KEY_AES=$(sed -n '1p' "$FILE_LOCAL_IFS" | tr -d '\n\r ')
+    IV_AES=$(sed -n '2p' "$FILE_LOCAL_IFS" | tr -d '\n\r ')
 
-    try:
-        with open(ruta_csv, 'r', encoding='utf-8-sig', errors='ignore') as file:
-            reader = csv.DictReader(file)
-            
-            # Limpieza de encabezados (quita comillas de los títulos)
-            if reader.fieldnames:
-                reader.fieldnames = [h.replace('"', '').strip() for h in reader.fieldnames]
+    # Validación simple de que no estén vacíos
+    if [ -z "$KEY_AES" ] || [ -z "$IV_AES" ]; then
+        echo "Error: La KEY o el IV están vacíos."
+        return 1
+    fi
 
-            total_txns = 0
-            suma_segundos = 0
-            
-            for row in reader:
-                # Busca las columnas TIMEIN / TIMEOUT
-                time_in = row.get('TIMEIN')
-                time_out = row.get('TIMEOUT')
+    echo "KEY e IV obtenidos correctamente." # Por seguridad no los imprimimos en el log
+}
 
-                segundos = calcular_segundos(time_in, time_out)
-                
-                if segundos is not None and segundos >= 0:
-                    total_txns += 1
-                    suma_segundos += segundos
-                    
-                    if segundos < 60:
-                        resultados[horario][int(segundos)] += 1
-                    else:
-                        resultados[horario][59] += 1
-            
-            promedio = suma_segundos / total_txns if total_txns > 0 else 0
-            print(f'OK {horario}: {total_txns} txns, prom {promedio:.2f}s')
+desencriptar_archivo() {
+    echo "Inicio desencriptado CBC AES..."
+    
+    if [ ! -f "$IN_ENC_FILE" ]; then
+        echo "Error: No existe el archivo encriptado entrada: $IN_ENC_FILE"
+        return 1
+    fi
 
-    except Exception as e:
-        print(f'Error en {horario}: {e}')
+    openssl enc -d -aes-256-cbc -K "$KEY_AES" -iv "$IV_AES" -in "$IN_ENC_FILE" -out "$DEC_FILE"
+    
+    if [ $? -eq 0 ]; then
+        echo "Fin de desencriptado. Archivo generado: $DEC_FILE"
+    else
+        echo "Error: Falló el comando openssl."
+        return 1
+    fi
+}
 
-# 2. GENERACIÓN DEL CSV (TABLA EXCEL)
-output_file = f'{base_path}REPORTE_FINAL_MATRIZ.csv'
+encriptar_archivo_pgp() {
+    echo "Inicio encriptado PGP..."
+    
+    # Se usa --always-trust para evitar fallos si la llave no está firmada localmente
+    "$PGP_BIN" --encrypt --recipient "$PGP_RECIPIENT" --input "$DEC_FILE" --output "$OUT_PGP_FILE" --always-trust
+    
+    if [ $? -eq 0 ]; then
+        echo "Fin de encriptado PGP. Archivo: $OUT_PGP_FILE"
+    else
+        echo "Error: Falló encriptación PGP."
+        return 1
+    fi
+}
 
-try:
-    with open(output_file, 'w', newline='', encoding='utf-8') as file:
-        # Usamos delimiter=';' para compatibilidad con Excel español
-        writer = csv.writer(file, delimiter=';')
-        
-        # Encabezados: SEGUNDOS, [HORARIOS...], TOTAL FILA
-        header = ['SEGUNDOS'] + list(archivos_csv.keys()) + ['TOTAL FILA']
-        writer.writerow(header)
-        
-        totales_por_columna = defaultdict(int)
-        gran_total_general = 0
+genera_control() {
+    echo "Generando archivo de control..."
+    # Cuenta lineas del archivo desencriptado
+    local count
+    count=$(wc -l < "$DEC_FILE")
+    # Limpia espacios en blanco del wc
+    count=$(echo "$count" | xargs)
+    
+    echo "Registros: $count" > "$OUT_CONTROL_FILE"
+    echo "Archivo de control generado: $OUT_CONTROL_FILE"
+}
 
-        # Filas de 0 a 59 segundos
-        for i in range(60):
-            if i == 59: label = '59s o mas'
-            else: label = f'{i} a {i+1} seg'
-            
-            fila_datos = [label]
-            total_fila_actual = 0
-            
-            for horario in archivos_csv.keys():
-                cantidad = resultados[horario][i]
-                fila_datos.append(cantidad)
-                
-                total_fila_actual += cantidad
-                totales_por_columna[horario] += cantidad
-            
-            fila_datos.append(total_fila_actual)
-            writer.writerow(fila_datos)
-            
-            gran_total_general += total_fila_actual
+transferir_y_limpiar_nfs() {
+    echo "Iniciando transferencia a NFS: $PATH_NFS_OUT"
 
-        # Fila de Totales Inferior
-        fila_totales = ['TOTAL GENERAL']
-        for horario in archivos_csv.keys():
-            fila_totales.append(totales_por_columna[horario])
-            
-        fila_totales.append(gran_total_general)
-        
-        writer.writerow([])
-        writer.writerow(fila_totales)
+    # Verificar que el directorio NFS existe y es escribible
+    if [ ! -d "$PATH_NFS_OUT" ]; then
+        echo "Error: El directorio NFS $PATH_NFS_OUT no existe o no es accesible."
+        return 1
+    fi
 
-    print(f'\n[EXITO] Reporte generado: {output_file}')
+    # 1. Limpiar directorio NFS destino
+    echo "Limpiando directorio destino NFS..."
+    # Usamos precaución: solo borrar archivos dentro del path especifico
+    # rm -f "${PATH_NFS_OUT:?}/"* <-- La sintaxis :? evita borrar si la variable está vacía (seguridad)
+    rm -f "${PATH_NFS_OUT}"/*
+    
+    # 2. Copiar archivos nuevos
+    echo "Copiando archivos a NFS..."
+    cp "$OUT_PGP_FILE" "$PATH_NFS_OUT"
+    cp "$OUT_CONTROL_FILE" "$PATH_NFS_OUT"
 
-except Exception as e:
-    print(f'Error al guardar archivo: {e}')
+    if [ $? -eq 0 ]; then
+        echo "Transferencia a NFS completada exitosamente."
+    else
+        echo "Error al copiar archivos al NFS."
+        return 1
+    fi
+}
 
-# 3. RESUMEN EN CONSOLA
-print('\n=== RESUMEN POR HORARIO ===')
-for horario in archivos_csv.keys():
-    total = sum(resultados[horario].values())
-    print(f'{horario}h: {total} transacciones')
+limpiar_temporales() {
+    echo "Eliminando directorio temporal: $DIR_TMP"
+    rm -rf "$DIR_TMP"
+}
+
+# ==============================================================================
+# MAIN
+# ==============================================================================
+
+main() {
+    echo "=== INICIO DE RUTINA SERVIDOR $(hostname) ==="
+    
+    # Ejecucion paso a paso
+    get_as400
+    obtener_key_iv
+    desencriptar_archivo
+    encriptar_archivo_pgp
+    genera_control
+    
+    # Paso especial NFS
+    transferir_y_limpiar_nfs
+
+    # Limpieza final
+    limpiar_temporales
+
+    echo "=== FIN DE RUTINA EXITOSO ==="
+}
+
+# Ejecutar Main y redirigir todo (stdout y stderr) a la función log
+# El "2>&1" redirige errores a la salida estándar para que el pipe los capture
+main 2>&1 | log
+
+-----
+
+# ==========================================
+# CONFIGURACION DEL PROCESO CRYPT CBC TO PGP
+# ==========================================
+
+# --- Rutas Locales y Binarios ---
+PGP_BIN="/opt/pgp/bin/pgp"
+# La ruta base se calcula automaticamente en el script,
+# pero aqui definimos las subcarpetas relativas o rutas absolutas extras.
+PATH_NFS_OUT="/nfshomedesa/usftp138/OUT/"
+
+# --- Configuración SFTP AS400 ---
+SFTP_USER="usddsad"
+SFTP_IP="10.10.10.10" 
+SFTP_KEY="/home/usddsad/.ssh/id_rsa"
+# Ruta remota donde buscar el archivo de propiedades/llaves
+REMOTE_DIR_AS400="/Cifrado_OPENSSL/EPM/Project/properties"
+REMOTE_FILE_AS400="props.properties"
+
+# --- Archivo a Desencriptar (Entrada) ---
+# Nombre del archivo encriptado local (o ruta relativa)
+INPUT_ENC_FILE="IN/LTAX1451.enc"
+
+# --- Configuración PGP (Salida) ---
+PGP_RECIPIENT="seginfo@izipay.pe"
+# Prefijo para el archivo de salida (Ej: LTAX1451 + FECHA)
+OUTPUT_FILENAME_PREFIX="LTAX1451"
+OUTPUT_CONTROL_PREFIX="ECTRL10925"
+
+# --- Nombres de archivos temporales (Interno) ---
+TEMP_PROP_FILE="props.properties"
+TEMP_DEC_FILE="LTAX1451.txt"
