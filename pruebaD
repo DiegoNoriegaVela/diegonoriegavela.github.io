@@ -6,14 +6,14 @@ set -eou pipefail
 # DESCRIPCION: Descarga llaves, desencripta AES-CBC, encripta PGP y mueve a NFS.
 # ==============================================================================
 
-# 1. Obtener directorio local absoluto donde reside el script (PWD dinámico)
+# 1. Obtener directorio local absoluto donde reside el script (PWD dinamico)
 DIR_LOCAL="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 
-# 2. Cargar archivo de configuración
+# 2. Cargar archivo de configuracion
 CONFIG_FILE="${DIR_LOCAL}/config.ini"
 
 if [ ! -f "$CONFIG_FILE" ]; then
-    echo "Error: No se encuentra el archivo de configuración $CONFIG_FILE"
+    echo "Error: No se encuentra el archivo de configuracion $CONFIG_FILE"
     exit 1
 fi
 
@@ -22,17 +22,13 @@ source "$CONFIG_FILE"
 # 3. Definicion de variables derivadas y fecha
 # Formato AAMMDD (Ej: 251126)
 DATE_YYMMDD=$(date +'%y%m%d')
-TIMESTAMP=$(date +'%Y-%m-%d %H:%M:%S')
 
 # Rutas de trabajo
-DIR_TMP="${DIR_LOCAL}/tmp"
-DIR_LOGS="${DIR_LOCAL}/logs"
 DIR_OUT_LOCAL="${DIR_LOCAL}/OUT"
 
 # Archivos
-LOG_FILE="${DIR_LOGS}/proceso_${DATE_YYMMDD}.log"
-FILE_LOCAL_IFS="${DIR_TMP}/${TEMP_PROP_FILE}"
-DEC_FILE="${DIR_TMP}/${TEMP_DEC_FILE}"
+FILE_LOCAL_IFS="${DIR_LOCAL}/${TEMP_PROP_FILE}"
+DEC_FILE="${DIR_LOCAL}/${TEMP_DEC_FILE}"
 IN_ENC_FILE="${DIR_LOCAL}/${INPUT_ENC_FILE}"
 
 # Nombres de Salida Finales
@@ -42,45 +38,67 @@ FINAL_CTL_NAME="${OUTPUT_CONTROL_PREFIX}${DATE_YYMMDD}.fin"
 OUT_PGP_FILE="${DIR_OUT_LOCAL}/${FINAL_PGP_NAME}"
 OUT_CONTROL_FILE="${DIR_OUT_LOCAL}/${FINAL_CTL_NAME}"
 
+# Variables globales para KEY e IV
+KEY_AES=""
+IV_AES=""
+
 # Crear directorios necesarios si no existen
-mkdir -p "$DIR_TMP" "$DIR_LOGS" "$DIR_OUT_LOCAL"
+mkdir -p "$DIR_OUT_LOCAL"
 
 # ==============================================================================
 # FUNCIONES
 # ==============================================================================
 
-log() {
-    # Función para loguear con timestamp, lee del stdin
-    while IFS= read -r line; do
-        echo "$(date +'%Y-%m-%d %H:%M:%S') - $line"
-        echo "$(date +'%Y-%m-%d %H:%M:%S') - $line" >> "$LOG_FILE"
-    done
+verificar_sftp() {
+    echo "Inicio verificacion conexion SFTP con ${SFTP_IP}..."
+
+    # Probar conexion SFTP
+    sftp -i "$SFTP_KEY" -oBatchMode=yes -oConnectTimeout=5 -oStrictHostKeyChecking=no "${SFTP_USER}@${SFTP_IP}" <<EOF
+exit
+EOF
+
+    if [ $? -ne 0 ]; then
+        echo "Error: No se pudo establecer conexion SFTP con ${SFTP_IP}"
+        return 1
+    fi
+
+    # Verificar si la ruta remota existe
+    echo "Se verifica ruta remota..."
+    VERIF_REMOTE=$(sftp -i "$SFTP_KEY" "${SFTP_USER}@${SFTP_IP}" 2>&1 <<EOF
+cd $REMOTE_DIR_AS400
+exit
+EOF
+)
+    
+    if echo "$VERIF_REMOTE" | grep -Eqi "No such file|failed"; then
+        echo "Error: El directorio remoto $REMOTE_DIR_AS400 no existe en el servidor SFTP ${SFTP_IP}"
+        return 1
+    fi
+    
+    echo "Conexion y ruta remota verificadas correctamente."
 }
 
 get_as400() {
     echo "Inicio SFTP GET desde ${SFTP_IP}..."
 
-    # Verificar conectividad básica (opcional, pero recomendado)
-    # echo "Probando conexión..."
-
-    # Ejecutar SFTP
-    # Usamos StrictHostKeyChecking=no para evitar prompts interactivos si cambia la fingerprint
-    if sftp -i "$SFTP_KEY" -oBatchMode=yes -oConnectTimeout=10 -oStrictHostKeyChecking=no "${SFTP_USER}@${SFTP_IP}" <<EOF
-lcd $DIR_TMP
+    # Ejecutar transferencia SFTP
+    sftp -i "$SFTP_KEY" -oBatchMode=yes -oConnectTimeout=10 -oStrictHostKeyChecking=no "${SFTP_USER}@${SFTP_IP}" <<EOF
+lcd $DIR_LOCAL
 cd $REMOTE_DIR_AS400
 get $REMOTE_FILE_AS400
 bye
 EOF
-    then
-        echo "Descarga SFTP exitosa en: $DIR_TMP"
-    else
+    
+    if [ $? -ne 0 ]; then
         echo "Error: Fallo la transferencia SFTP desde $SFTP_IP"
         return 1
     fi
+
+    echo "Descarga SFTP exitosa en: $DIR_LOCAL"
 }
 
 obtener_key_iv() {
-    echo "Inicio obtención de KEY e IV desde propiedades..."
+    echo "Inicio obtencion de KEY e IV desde propiedades..."
     
     if [ ! -f "$FILE_LOCAL_IFS" ]; then
         echo "Error: No existe el archivo de propiedades $FILE_LOCAL_IFS"
@@ -91,13 +109,13 @@ obtener_key_iv() {
     KEY_AES=$(sed -n '1p' "$FILE_LOCAL_IFS" | tr -d '\n\r ')
     IV_AES=$(sed -n '2p' "$FILE_LOCAL_IFS" | tr -d '\n\r ')
 
-    # Validación simple de que no estén vacíos
+    # Validacion simple de que no esten vacios
     if [ -z "$KEY_AES" ] || [ -z "$IV_AES" ]; then
-        echo "Error: La KEY o el IV están vacíos."
+        echo "Error: La KEY o el IV estan vacios."
         return 1
     fi
 
-    echo "KEY e IV obtenidos correctamente." # Por seguridad no los imprimimos en el log
+    echo "KEY e IV obtenidos correctamente."
 }
 
 desencriptar_archivo() {
@@ -108,12 +126,13 @@ desencriptar_archivo() {
         return 1
     fi
 
+    # Se usa -K mayuscula para llave hexadecimal
     openssl enc -d -aes-256-cbc -K "$KEY_AES" -iv "$IV_AES" -in "$IN_ENC_FILE" -out "$DEC_FILE"
     
     if [ $? -eq 0 ]; then
         echo "Fin de desencriptado. Archivo generado: $DEC_FILE"
     else
-        echo "Error: Falló el comando openssl."
+        echo "Error: Fallo el comando openssl."
         return 1
     fi
 }
@@ -121,13 +140,13 @@ desencriptar_archivo() {
 encriptar_archivo_pgp() {
     echo "Inicio encriptado PGP..."
     
-    # Se usa --always-trust para evitar fallos si la llave no está firmada localmente
+    # Se usa --always-trust para evitar fallos si la llave no esta firmada localmente
     "$PGP_BIN" --encrypt --recipient "$PGP_RECIPIENT" --input "$DEC_FILE" --output "$OUT_PGP_FILE" --always-trust
     
     if [ $? -eq 0 ]; then
         echo "Fin de encriptado PGP. Archivo: $OUT_PGP_FILE"
     else
-        echo "Error: Falló encriptación PGP."
+        echo "Error: Fallo encriptacion PGP."
         return 1
     fi
 }
@@ -155,8 +174,8 @@ transferir_y_limpiar_nfs() {
 
     # 1. Limpiar directorio NFS destino
     echo "Limpiando directorio destino NFS..."
-    # Usamos precaución: solo borrar archivos dentro del path especifico
-    # rm -f "${PATH_NFS_OUT:?}/"* <-- La sintaxis :? evita borrar si la variable está vacía (seguridad)
+    # Usamos precaucion: solo borrar archivos dentro del path especifico
+    # rm -f "${PATH_NFS_OUT:?}/"* <-- La sintaxis :? evita borrar si la variable esta vacia
     rm -f "${PATH_NFS_OUT}"/*
     
     # 2. Copiar archivos nuevos
@@ -173,8 +192,8 @@ transferir_y_limpiar_nfs() {
 }
 
 limpiar_temporales() {
-    echo "Eliminando directorio temporal: $DIR_TMP"
-    rm -rf "$DIR_TMP"
+    echo "Eliminando archivos temporales..."
+    rm -f "$FILE_LOCAL_IFS" "$DEC_FILE"
 }
 
 # ==============================================================================
@@ -185,6 +204,7 @@ main() {
     echo "=== INICIO DE RUTINA SERVIDOR $(hostname) ==="
     
     # Ejecucion paso a paso
+    verificar_sftp
     get_as400
     obtener_key_iv
     desencriptar_archivo
@@ -200,40 +220,6 @@ main() {
     echo "=== FIN DE RUTINA EXITOSO ==="
 }
 
-# Ejecutar Main y redirigir todo (stdout y stderr) a la función log
-# El "2>&1" redirige errores a la salida estándar para que el pipe los capture
-main 2>&1 | log
+# Ejecutar Main y redirigir errores a la salida estandar
+main 2>&1
 
------
-
-# ==========================================
-# CONFIGURACION DEL PROCESO CRYPT CBC TO PGP
-# ==========================================
-
-# --- Rutas Locales y Binarios ---
-PGP_BIN="/opt/pgp/bin/pgp"
-# La ruta base se calcula automaticamente en el script,
-# pero aqui definimos las subcarpetas relativas o rutas absolutas extras.
-PATH_NFS_OUT="/nfshomedesa/usftp138/OUT/"
-
-# --- Configuración SFTP AS400 ---
-SFTP_USER="usddsad"
-SFTP_IP="10.10.10.10" 
-SFTP_KEY="/home/usddsad/.ssh/id_rsa"
-# Ruta remota donde buscar el archivo de propiedades/llaves
-REMOTE_DIR_AS400="/Cifrado_OPENSSL/EPM/Project/properties"
-REMOTE_FILE_AS400="props.properties"
-
-# --- Archivo a Desencriptar (Entrada) ---
-# Nombre del archivo encriptado local (o ruta relativa)
-INPUT_ENC_FILE="IN/LTAX1451.enc"
-
-# --- Configuración PGP (Salida) ---
-PGP_RECIPIENT="seginfo@izipay.pe"
-# Prefijo para el archivo de salida (Ej: LTAX1451 + FECHA)
-OUTPUT_FILENAME_PREFIX="LTAX1451"
-OUTPUT_CONTROL_PREFIX="ECTRL10925"
-
-# --- Nombres de archivos temporales (Interno) ---
-TEMP_PROP_FILE="props.properties"
-TEMP_DEC_FILE="LTAX1451.txt"
