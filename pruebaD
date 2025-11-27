@@ -1,11 +1,45 @@
+# ==========================================
+# CONFIGURACION DEL PROCESO CRYPT CBC TO PGP
+# ==========================================
+
+# --- Configuracion General ---
+PGP_BIN="/opt/pgp/bin/pgp"
+
+# --- Destino Final (NFS - IZIPAY) ---
+# Los archivos generados iran DIRECTAMENTE aqui.
+PATH_NFS_OUT="/nfshomedesa/usftp138/OUT/"
+
+# --- Credenciales SFTP AS400 ---
+SFTP_USER="usddsad"
+SFTP_IP="10.10.10.10"
+SFTP_KEY="/home/usddsad/.ssh/id_rsa"
+
+# --- 1. Configuracion Propiedades (Llaves) ---
+REMOTE_DIR_PROPS="/Cifrado_OPENSSL/EPM/Project/properties"
+REMOTE_FILE_PROPS="props.properties"
+
+# --- 2. Configuracion Datos (Input Encriptado) ---
+REMOTE_DIR_INPUT="/home/usddsad/input_files/encrypted"
+REMOTE_FILE_INPUT="LTAX1451.enc"
+
+# --- Configuracion PGP (Salida) ---
+PGP_RECIPIENT="seginfo@izipay.pe"
+OUTPUT_FILENAME_PREFIX="LTAX1451"
+OUTPUT_CONTROL_PREFIX="ECTRL10925"
+
+# --- Nombres Internos (Temporales) ---
+TEMP_PROP_FILE="props.properties"
+TEMP_DEC_FILE="LTAX1451.txt"
+
+-----
+
 #!/bin/bash
 set -eou pipefail
 
 # ==============================================================================
 # SCRIPT: cryptCbcToPgp.sh
-# DESCRIPCION: 1. Prepara entorno local (crea carpetas si no existen).
-#              2. Descarga llaves y archivo encriptado del AS400.
-#              3. Desencripta AES-CBC, encripta PGP y mueve a NFS.
+# DESCRIPCION: Procesa archivos desde AS400 y entrega directamente en NFS.
+#              No genera backups locales en carpeta OUT.
 # ==============================================================================
 
 # 1. Obtener directorio local absoluto
@@ -22,24 +56,24 @@ fi
 # shellcheck source=config.ini
 source "$CONFIG_FILE"
 
-# 3. Definicion de variables y rutas
+# 3. Definicion de variables
 DATE_YYMMDD=$(date +'%y%m%d')
 
-# Rutas de trabajo internas (Estas se crearan automaticamente)
+# Directorio temporal de trabajo (Unica carpeta local necesaria)
 DIR_TMP="${DIR_LOCAL}/tmp"
-DIR_OUT_LOCAL="${DIR_LOCAL}/OUT"
 
-# Archivos
+# Rutas de archivos temporales
 FILE_LOCAL_IFS="${DIR_TMP}/${TEMP_PROP_FILE}"
 DEC_FILE="${DIR_TMP}/${TEMP_DEC_FILE}"
 IN_ENC_FILE="${DIR_TMP}/${REMOTE_FILE_INPUT}"
 
-# Nombres de Salida Finales
+# --- RUTAS DE SALIDA (DIRECTO A NFS) ---
+# Se construyen las rutas finales apuntando a la carpeta compartida
 FINAL_PGP_NAME="${OUTPUT_FILENAME_PREFIX}${DATE_YYMMDD}.txt.pgp"
 FINAL_CTL_NAME="${OUTPUT_CONTROL_PREFIX}${DATE_YYMMDD}.fin"
 
-OUT_PGP_FILE="${DIR_OUT_LOCAL}/${FINAL_PGP_NAME}"
-OUT_CONTROL_FILE="${DIR_OUT_LOCAL}/${FINAL_CTL_NAME}"
+OUT_PGP_FILE="${PATH_NFS_OUT}/${FINAL_PGP_NAME}"
+OUT_CONTROL_FILE="${PATH_NFS_OUT}/${FINAL_CTL_NAME}"
 
 # ==============================================================================
 # FUNCIONES
@@ -51,22 +85,33 @@ log() {
     done
 }
 
-preparar_entorno_local() {
-    echo "--- PASO 0: Preparacion del entorno local ---"
+preparar_entorno() {
+    echo "--- PASO 0: Preparacion del entorno ---"
     
-    # Creamos directorios locales. 
-    # mkdir -p crea la carpeta si no existe, y no da error si ya existe.
-    if mkdir -p "$DIR_TMP" "$DIR_OUT_LOCAL"; then
-        echo "Directorios locales verificados: $DIR_TMP y $DIR_OUT_LOCAL"
+    # 1. Crear carpeta temporal local si no existe
+    if mkdir -p "$DIR_TMP"; then
+        echo "Directorio temporal verificado: $DIR_TMP"
     else
-        echo "Error: No se pudieron crear los directorios locales. Verifique permisos."
+        echo "Error: No se pudo crear el directorio temporal."
         return 1
     fi
+
+    # 2. Verificar acceso a carpeta NFS (Destino Final)
+    if [ ! -d "$PATH_NFS_OUT" ]; then
+        echo "Error Critico: El directorio NFS $PATH_NFS_OUT no es accesible."
+        return 1
+    fi
+
+    # 3. LIMPIEZA PREVIA DE NFS
+    # Como escribiremos directo, limpiamos antes de empezar el proceso de encriptado
+    echo "Limpiando directorio NFS destino ($PATH_NFS_OUT)..."
+    rm -f "${PATH_NFS_OUT:?}"/*
+    echo "Directorio NFS limpio."
 }
 
 check_remote_dir() {
     local dir_to_check="$1"
-    echo "Verificando existencia de ruta remota: $dir_to_check ..."
+    echo "Verificando ruta remota SFTP: $dir_to_check ..."
     
     VERIF_REMOTE=$(sftp -i "$SFTP_KEY" -oBatchMode=yes -oStrictHostKeyChecking=no "${SFTP_USER}@${SFTP_IP}" 2>&1 <<EOF
 cd $dir_to_check
@@ -77,139 +122,87 @@ EOF
         echo "Error: El directorio remoto '$dir_to_check' no existe."
         return 1
     fi
-    echo "Ruta remota verificada correctamente."
 }
 
-get_props_as400() {
-    echo "--- PASO 1: Obtener Archivo de Propiedades (Llaves) ---"
+get_files_as400() {
+    echo "--- PASO 1: Descarga de archivos desde AS400 ---"
 
     check_remote_dir "$REMOTE_DIR_PROPS"
+    check_remote_dir "$REMOTE_DIR_INPUT"
 
-    echo "Descargando propiedades..."
+    echo "Descargando propiedades y archivo encriptado..."
     if sftp -i "$SFTP_KEY" -oBatchMode=yes -oStrictHostKeyChecking=no "${SFTP_USER}@${SFTP_IP}" <<EOF >/dev/null 2>&1
 lcd $DIR_TMP
 cd $REMOTE_DIR_PROPS
 get $REMOTE_FILE_PROPS
-bye
-EOF
-    then
-        echo "Archivo de propiedades descargado exitosamente."
-    else
-        echo "Error: Fallo la descarga de $REMOTE_FILE_PROPS"
-        return 1
-    fi
-}
-
-get_input_file_as400() {
-    echo "--- PASO 2: Obtener Archivo Encriptado (Input) ---"
-    
-    check_remote_dir "$REMOTE_DIR_INPUT"
-
-    echo "Descargando archivo de datos encriptado..."
-    if sftp -i "$SFTP_KEY" -oBatchMode=yes -oStrictHostKeyChecking=no "${SFTP_USER}@${SFTP_IP}" <<EOF >/dev/null 2>&1
-lcd $DIR_TMP
 cd $REMOTE_DIR_INPUT
 get $REMOTE_FILE_INPUT
 bye
 EOF
     then
-        echo "Archivo de datos descargado exitosamente en TMP."
+        echo "Archivos descargados correctamente en TMP."
     else
-        echo "Error: Fallo la descarga del archivo de datos $REMOTE_FILE_INPUT"
+        echo "Error: Fallo la descarga SFTP."
         return 1
     fi
 }
 
 obtener_key_iv() {
-    echo "--- PASO 3: Extraccion de KEY e IV ---"
-
+    echo "--- PASO 2: Extraccion de credenciales ---"
     if [ ! -f "$FILE_LOCAL_IFS" ]; then
-        echo "Error: No existe el archivo de propiedades en TMP."
+        echo "Error: No se encontro el archivo de propiedades."
         return 1
     fi
-
     KEY_AES=$(sed -n '1p' "$FILE_LOCAL_IFS" | tr -d '\n\r ')
     IV_AES=$(sed -n '2p' "$FILE_LOCAL_IFS" | tr -d '\n\r ')
-
+    
     if [ -z "$KEY_AES" ] || [ -z "$IV_AES" ]; then
-        echo "Error: Datos de KEY o IV invalidos."
+        echo "Error: Credenciales vacias."
         return 1
     fi
-    echo "Credenciales de cifrado obtenidas."
 }
 
 desencriptar_archivo() {
-    echo "--- PASO 4: Desencriptado AES ---"
-
+    echo "--- PASO 3: Desencriptado AES (Local TMP) ---"
     if [ ! -f "$IN_ENC_FILE" ]; then
-        echo "Error: No se encuentra el archivo encriptado descargado: $IN_ENC_FILE"
+        echo "Error: Falta archivo input."
         return 1
     fi
 
-    openssl enc -d -aes-256-cbc -K "$KEY_AES" -iv "$IV_AES" -in "$IN_ENC_FILE" -out "$DEC_FILE"
+    # NOTA: Se usa -k (minuscula) para indicar Passphrase (contraseña)
+    openssl enc -d -aes-256-cbc -k "$KEY_AES" -iv "$IV_AES" -in "$IN_ENC_FILE" -out "$DEC_FILE"
 
     if [ $? -eq 0 ]; then
-        echo "Desencriptado exitoso. Generado: $DEC_FILE"
+        echo "Desencriptado correcto."
     else
-        echo "Error: Fallo openssl."
+        echo "Error: Fallo openssl (bad decrypt). Revise la contraseña."
         return 1
     fi
 }
 
-encriptar_archivo_pgp() {
-    echo "--- PASO 5: Encriptado PGP ---"
-
-    # Verificacion basica de existencia del binario PGP (ya que no lo podemos crear)
-    if [ ! -x "$PGP_BIN" ]; then
-        echo "Error: El ejecutable PGP no existe o no tiene permisos: $PGP_BIN"
-        return 1
-    fi
-
+encriptar_y_control_nfs() {
+    echo "--- PASO 4: Encriptado PGP y Entrega a NFS ---"
+    
+    # 1. Encriptar directo al NFS
+    echo "Generando archivo PGP en ruta NFS: $OUT_PGP_FILE"
     "$PGP_BIN" --encrypt --recipient "$PGP_RECIPIENT" --input "$DEC_FILE" --output "$OUT_PGP_FILE" --always-trust
 
-    if [ $? -eq 0 ]; then
-        echo "Encriptado PGP exitoso."
-    else
-        echo "Error en PGP."
+    if [ $? -ne 0 ]; then
+        echo "Error al generar archivo PGP en NFS."
         return 1
     fi
-}
 
-genera_control() {
-    echo "--- PASO 6: Generacion de Control ---"
+    # 2. Generar control directo al NFS
+    echo "Generando archivo de control en NFS..."
     local count
-    count=$(wc -l < "$DEC_FILE")
-    count=$(echo "$count" | xargs)
+    count=$(wc -l < "$DEC_FILE" | xargs)
+    
     echo "Registros: $count" > "$OUT_CONTROL_FILE"
-    echo "Control generado."
-}
-
-transferir_y_limpiar_nfs() {
-    echo "--- PASO 7: Transferencia a NFS ---"
-
-    # Verificamos carpeta NFS (No la podemos crear, debe existir)
-    if [ ! -d "$PATH_NFS_OUT" ]; then
-        echo "Error: Directorio NFS no accesible: $PATH_NFS_OUT"
-        return 1
-    fi
-
-    echo "Limpiando NFS destino..."
-    rm -f "${PATH_NFS_OUT:?}"/*
-
-    echo "Copiando archivos..."
-    cp "$OUT_PGP_FILE" "$PATH_NFS_OUT"
-    cp "$OUT_CONTROL_FILE" "$PATH_NFS_OUT"
-
-    if [ $? -eq 0 ]; then
-        echo "Archivos copiados a NFS correctamente."
-    else
-        echo "Error al copiar a NFS."
-        return 1
-    fi
+    echo "Archivos entregados exitosamente en NFS."
 }
 
 limpiar_temporales() {
-    echo "Limpiando directorio TMP..."
+    echo "Limpiando directorio TMP local..."
     rm -rf "$DIR_TMP"
 }
 
@@ -220,17 +213,12 @@ limpiar_temporales() {
 main() {
     echo "=== INICIO PROCESO EN $(hostname) ==="
 
-    preparar_entorno_local # <--- AQUI SE CREAN TMP Y OUT SI NO EXISTEN
-    
-    get_props_as400
-    get_input_file_as400
-    obtener_key_iv
-    desencriptar_archivo
-    encriptar_archivo_pgp
-    genera_control
-    transferir_y_limpiar_nfs
-    
-    limpiar_temporales
+    preparar_entorno        # Crea tmp y limpia NFS destino
+    get_files_as400         # Descarga todo
+    obtener_key_iv          # Lee llaves
+    desencriptar_archivo    # Desencripta en tmp
+    encriptar_y_control_nfs # Escribe resultado final en NFS
+    limpiar_temporales      # Borra tmp
 
     echo "=== FIN PROCESO EXITOSO ==="
 }
