@@ -1,0 +1,38 @@
+Este segundo audio trata de otro proyecto, relacionado a las campañas Club Sueldo y cobro de comisiones por retiros en cajeros foráneos, pero también rozan temas del proyecto anterior (errores en producción y análisis de data).
+
+Te lo resumo así:
+	1.	Contexto de la campaña Club Sueldo
+	•	Las campañas duran un mes (ejemplo: 1 al 30 de noviembre).
+	•	Antes de iniciar el mes siguiente, el banco crea la campaña y registra a los clientes con cuenta sueldo.
+	•	El beneficio: el cliente tiene 2 retiros gratuitos en cajeros foráneos a nivel nacional; a partir del tercer retiro se cobra comisión.
+	2.	Problema detectado en producción
+	•	En producción, los clientes reclamaban: en una nueva campaña (nuevo año), en su “primer” retiro foráneo ya se les cobraba comisión, a pesar de tener derecho a 2 retiros gratis.
+	•	La causa: el programa genérico (un GEN en RPG/CL) que controla los retiros solo comparaba mes, pero no el año.
+	•	Si el cliente ya había hecho 3 retiros en noviembre del año anterior, su contador quedaba en 3.
+	•	Al llegar noviembre del año siguiente, el contador no se reiniciaba, y el programa interpretaba el nuevo retiro como el cuarto, por lo que seguía cobrando comisión.
+	3.	Corrección funcional
+	•	Se modificó el programa para que la comparación sea mes + año, de modo que al cambiar de año se reinicie el contador de retiros en campaña.
+	•	Con este cambio, en cada nueva campaña anual, el primer retiro vuelve a contarse desde cero y se respetan los 2 retiros gratuitos.
+	4.	Problemas en ambiente de UT / QA
+	•	Al hacer las pruebas con el usuario (Yribán / Luis Arizaga) en UT, las transacciones caían con código de error 23.
+	•	El error 23 se debía a que una tablita de parámetros (con campos como tipo operación, canal, etc.) estaba incompleta o mal configurada en UT, no en el código del desarrollo.
+	•	Para identificar exactamente qué valores estaban faltando, se decidió añadir PRINTs (logs) a programas RPG (por ejemplo el programa 925 y otros 75xx), usando CLs de apoyo.
+	•	Hubo problemas para transferir/impactar el objeto con PRINT a UT (tema de rutas nuevas y usuario sin carpeta configurada); esto se escaló a Lucio para que solucione la ruta/permisos.
+	5.	Uso de tramas y data de producción para validar
+	•	Primero probaron con tramas generadas en desarrollo, pero seguía cayendo en UT.
+	•	Para evitar dudas de posiciones de campos, se pidió una trama real de producción (apoyaron José Carlos y Esteban).
+	•	Con la trama de producción se confirmó que la lógica del desarrollo estaba bien y que el problema era configuración del ambiente UT, no del programa.
+	6.	Identificación de clientes afectados (cobro indebido de comisión)
+	•	El usuario quiere un “stock” o listado de todos los clientes a los que se les cobró comisión indebidamente estando en campaña.
+	•	Para eso se pidió data de producción a Dennis, Carol, etc.:
+	•	Tablas LW08 / LW16 (histórico de transacciones) y luego la tabla 15 (cabecera contable) para cruzar información.
+	•	Pedro explicó que tener registros en la 16 no garantiza que se contabilizó; lo que manda es la tabla 15.
+	•	Por eso se solicitaron consultas (Query 1, 2, 3) sobre la tabla 15, cruzadas con la 16, para rango de fechas desde mayo a septiembre, y poder confirmar qué operaciones se ejecutaron y se contabilizaron realmente.
+	•	Esa información servirá para que el usuario arme sus estadísticos y ver a quién se cobró comisión de más. Parte de esa data aún está pendiente de envío/respuesta.
+	7.	Relación con el proyecto anterior
+	•	Igual que en el caso del STOP por cantidad de tarjetas (tabla CAR), aquí también hay un patrón:
+	•	Problema que solo se ve en producción.
+	•	Se usan tramas reales, tablas históricas y PRINTs en RPG para identificar la causa.
+	•	Se deja todo documentado en carpetas compartidas, correos, evidencias de pruebas y usuarios involucrados (Luis Arizaga, Dennis, José Carlos, etc.).
+
+Si quieres, después te puedo armar un resumen ejecutivo en formato “acta de incidente / lección aprendida” de ambos proyectos juntos (campañas Club Sueldo + STOP tarjetas CAR).
