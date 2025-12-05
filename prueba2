@@ -1,1 +1,1 @@
-prueba
+Ambos sistemas operan bajo el estándar de arquitectura SSH 2.0 (RFC 4253). La negociación de algoritmos (KEX y Ciphers) entre la versión 9.7p1 y 10.0p2 es exitosa dado que ambas soportan cifrados modernos como chacha20-poly1305 y ed25519, asegurando la interoperabilidad sin necesidad de ajustes manuales.
