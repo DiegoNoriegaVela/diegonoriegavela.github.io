@@ -1,180 +1,162 @@
-#!/bin/bash
+import java.io.*;
+import java.nio.charset.Charset;
+import java.nio.file.*;
+import java.util.ArrayList;
+import java.util.List;
 
-# --- CONFIGURACIÓN ---
-# Asegúrate de exportar estas variables antes o definirlas aquí
-# export ESP_DB_USER="tu_usuario"
-# export ESP_DB_PASS="tu_contraseña"
-DB_CONNString="${ESP_DB_USER}/${ESP_DB_PASS}@//tuhost:tuport/tuservice"
+public class IpmBatchConverter {
 
-# Nombre de archivos temporales
-SQL_FILE="temp_script.sql"
-RESULT_FILE="temp_result.txt"
+    private static final int BLOCK_SIZE = 1014;
+    private static final int DATA_PER_BLOCK = 1012;
+    private static final byte PAD_40 = 0x40;
 
-# Función para limpiar archivos temporales al salir
-cleanup() {
-    rm -f $SQL_FILE $RESULT_FILE
+    public static void main(String[] args) {
+        if (args.length < 4) {
+            System.out.println("Uso: java IpmBatchConverter --input <ruta_directorio> --output <ruta_salida>");
+            return;
+        }
+
+        String inputPath = null;
+        String outputPath = null;
+
+        for (int i = 0; i < args.length; i++) {
+            if ("--input".equals(args[i]) && i + 1 < args.length) inputPath = args[++i];
+            else if ("--output".equals(args[i]) && i + 1 < args.length) outputPath = args[++i];
+        }
+
+        if (inputPath == null || outputPath == null) {
+            System.err.println("Faltan argumentos.");
+            return;
+        }
+
+        try {
+            File sourceDir = new File(inputPath);
+            File destDir = new File(outputPath);
+            
+            System.out.println("Iniciando procesamiento masivo...");
+            processDirectory(sourceDir, sourceDir, destDir);
+            System.out.println("Proceso completado.");
+
+        } catch (Exception e) {
+            e.printStackTrace();
+        }
+    }
+
+    /**
+     * Recorre directorios recursivamente y procesa archivos
+     */
+    private static void processDirectory(File currentDir, File rootSrc, File rootDest) throws IOException {
+        if (!currentDir.exists()) return;
+
+        File[] files = currentDir.listFiles();
+        if (files == null) return;
+
+        for (File f : files) {
+            if (f.isDirectory()) {
+                processDirectory(f, rootSrc, rootDest);
+            } else {
+                // Calcular ruta relativa para replicar estructura
+                String relativePath = rootSrc.toURI().relativize(f.toURI()).getPath();
+                File destFile = new File(rootDest, relativePath + ".txt");
+                
+                // Crear directorios si no existen
+                destFile.getParentFile().mkdirs();
+                
+                System.out.println("Procesando: " + f.getName() + " -> " + destFile.getName());
+                convertFile(f, destFile);
+            }
+        }
+    }
+
+    /**
+     * Logica principal de conversion de un solo archivo
+     */
+    private static void convertFile(File input, File output) {
+        try {
+            byte[] raw = Files.readAllBytes(input.toPath());
+
+            // 1. Detectar y remover blocking 1014 de Mastercard
+            byte[] vbs = isBlocked(raw) ? remove1014Blocking(raw) : raw;
+
+            // 2. Parsear registros RDW (Variable Record Length)
+            List<byte[]> records = parseVbsRecords(vbs);
+
+            // 3. Escribir salida en formato Hibrido (Texto + {HEX})
+            // Usamos UTF-8 para que soporte los corchetes y caracteres normales
+            try (BufferedWriter writer = new BufferedWriter(
+                    new OutputStreamWriter(new FileOutputStream(output), "UTF-8"))) {
+                
+                Charset ebcdic = Charset.forName("Cp500");
+
+                for (byte[] rec : records) {
+                    writer.write(toHybridHex(rec, ebcdic));
+                    writer.write("\n");
+                }
+            }
+
+        } catch (Exception e) {
+            System.err.println("Error convirtiendo " + input.getName() + ": " + e.getMessage());
+        }
+    }
+
+    /**
+     * CONVERSION CLAVE: Texto visible o {HEX} para binarios
+     */
+    private static String toHybridHex(byte[] bytes, Charset cs) {
+        String text = new String(bytes, cs);
+        StringBuilder sb = new StringBuilder();
+
+        for (int i = 0; i < bytes.length; i++) {
+            char c = text.charAt(i);
+            // Si es legible (Letras, numeros, simbolos basicos ASCII 32-126)
+            if (c >= 32 && c <= 126) {
+                sb.append(c);
+            } else {
+                // Si es binario/control, imprimir byte original en HEX
+                sb.append(String.format("{%02X}", bytes[i]));
+            }
+        }
+        return sb.toString();
+    }
+
+    // --- UTILIDADES DE PARSEO (Mantenidas para leer correctamente el IPM) ---
+
+    private static List<byte[]> parseVbsRecords(byte[] vbs) {
+        List<byte[]> records = new ArrayList<>();
+        int pos = 0;
+        while (pos + 4 <= vbs.length) {
+            int len = ((vbs[pos] & 0xFF) << 24) | ((vbs[pos+1] & 0xFF) << 16) | 
+                      ((vbs[pos+2] & 0xFF) << 8) | (vbs[pos+3] & 0xFF);
+            pos += 4;
+            if (len == 0) break; // EOF
+            if (pos + len > vbs.length) len = vbs.length - pos; // Safety
+            
+            byte[] rec = new byte[len];
+            System.arraycopy(vbs, pos, rec, 0, len);
+            records.add(rec);
+            pos += len;
+        }
+        return records;
+    }
+
+    private static boolean isBlocked(byte[] raw) {
+        if (raw.length % BLOCK_SIZE != 0) return false;
+        // Check rapido: si el ultimo bloque termina en padding 0x40 0x40
+        int last = raw.length;
+        return raw.length >= 2 && raw[last-1] == PAD_40 && raw[last-2] == PAD_40;
+    }
+
+    private static byte[] remove1014Blocking(byte[] raw) {
+        ByteArrayOutputStream out = new ByteArrayOutputStream(raw.length);
+        int pos = 0;
+        while (pos < raw.length) {
+            int rem = raw.length - pos;
+            int take = Math.min(rem, BLOCK_SIZE);
+            // Tomamos 1012 datos (o lo que quede) ignorando los ultimos 2 bytes de padding si es bloque completo
+            int dataLen = (take == BLOCK_SIZE) ? DATA_PER_BLOCK : take;
+            out.write(raw, pos, dataLen);
+            pos += take;
+        }
+        return out.toByteArray();
+    }
 }
-trap cleanup EXIT
-
-# ==========================================
-# MENÚ PRINCIPAL
-# ==========================================
-show_menu() {
-    clear
-    echo "========================================"
-    echo "   GESTOR DE TRACKING (Shell Helper)"
-    echo "========================================"
-    echo "1. Consultar y Actualizar (Primer Comportamiento)"
-    echo "2. Rollback / Revertir cambios (Segundo Comportamiento)"
-    echo "3. Salir"
-    echo "========================================"
-    read -p "Seleccione una opción: " OPCION
-}
-
-# ==========================================
-# COMPORTAMIENTO 1: CONSULTA Y UPDATE
-# ==========================================
-do_process() {
-    echo ""
-    read -p "Ingrese el BIN a consultar: " BIN_INPUT
-    
-    # 1. Generar el script SQL para obtener los grupos
-    # Usamos concatenación con pipe '|' para facilitar la lectura en bash
-    echo "SET PAGESIZE 0 FEEDBACK OFF VERIFY OFF HEADING OFF ECHO OFF" > $SQL_FILE
-    echo "SELECT TO_CHAR(BATCH, 'DD/MM/YYYY') || '|' || COUNT(*) " >> $SQL_FILE
-    echo "FROM esp.card" >> $SQL_FILE
-    echo "WHERE TRIM(BIN) = '$BIN_INPUT'" >> $SQL_FILE
-    echo "AND TRACKING = 'P'" >> $SQL_FILE
-    echo "GROUP BY BATCH, BIN, TRACKING" >> $SQL_FILE
-    echo "ORDER BY BATCH;" >> $SQL_FILE
-    echo "EXIT;" >> $SQL_FILE
-
-    # 2. Ejecutar sqlplus y guardar resultado
-    sqlplus -S $DB_CONNString @$SQL_FILE > $RESULT_FILE
-
-    # 3. Leer el resultado en un array
-    # Verificamos si hay resultados
-    if [ ! -s $RESULT_FILE ]; then
-        echo "No se encontraron registros en estado 'P' para el BIN $BIN_INPUT."
-        read -p "Presione Enter para continuar..."
-        return
-    fi
-
-    echo ""
-    echo "--- Registros encontrados para BIN: $BIN_INPUT ---"
-    
-    # Declaramos arrays
-    declare -a BATCHES
-    declare -a COUNTS
-    i=1
-
-    # Leemos linea por linea el archivo generado
-    while IFS='|' read -r batch_date count_val; do
-        # Limpiamos espacios en blanco
-        batch_date=$(echo $batch_date | xargs)
-        count_val=$(echo $count_val | xargs)
-        
-        if [ -n "$batch_date" ]; then
-            BATCHES[$i]=$batch_date
-            COUNTS[$i]=$count_val
-            echo "$i) BIN: $BIN_INPUT | TRACKING: P | BATCH: $batch_date | COUNT: $count_val"
-            ((i++))
-        fi
-    done < $RESULT_FILE
-
-    echo ""
-    echo "IMPORTANTE: Seleccione la opción que desea MANTENER en 'P'."
-    echo "El resto de grupos se actualizarán a 'K' momentáneamente."
-    read -p "Ingrese el número de opción: " SELECTION
-
-    # Validar selección
-    if [[ -z "${BATCHES[$SELECTION]}" ]]; then
-        echo "Opción inválida."
-        return
-    fi
-
-    SELECTED_BATCH="${BATCHES[$SELECTION]}"
-    echo ">> Ha seleccionado mantener el BATCH: $SELECTED_BATCH"
-    
-    # 4. Generar el script de UPDATE para los NO seleccionados
-    echo "Generando script de actualización..."
-    
-    echo "SET FEEDBACK ON" > $SQL_FILE
-    echo "PROMPT Actualizando registros no seleccionados a 'K'..." >> $SQL_FILE
-    
-    # Recorremos el array para crear los updates de los que NO fueron elegidos
-    for idx in "${!BATCHES[@]}"; do
-        if [ "$idx" -ne "$SELECTION" ]; then
-            CURRENT_BATCH="${BATCHES[$idx]}"
-            # Query de update específica para ese grupo
-            echo "UPDATE esp.card SET TRACKING = 'K'" >> $SQL_FILE
-            echo "WHERE TRIM(BIN) = '$BIN_INPUT'" >> $SQL_FILE
-            echo "AND BATCH = TO_DATE('$CURRENT_BATCH', 'DD/MM/YYYY')" >> $SQL_FILE
-            echo "AND TRACKING = 'P';" >> $SQL_FILE
-        fi
-    done
-    
-    echo "COMMIT;" >> $SQL_FILE
-    echo "PROMPT Proceso terminado." >> $SQL_FILE
-    echo "EXIT;" >> $SQL_FILE
-
-    # 5. Ejecutar los updates
-    echo "Ejecutando cambios en base de datos..."
-    sqlplus -S $DB_CONNString @$SQL_FILE
-    
-    read -p "Operación completada. Presione Enter para volver."
-}
-
-# ==========================================
-# COMPORTAMIENTO 2: ROLLBACK (REVERTIR)
-# ==========================================
-do_rollback() {
-    echo ""
-    echo "--- MODO ROLLBACK ---"
-    read -p "Ingrese el BIN para realizar el rollback (K -> P): " BIN_INPUT
-
-    # 1. Mostrar estado actual (Informativo)
-    echo "Consultando estado actual..."
-    echo "SET PAGESIZE 50 FEEDBACK OFF VERIFY OFF HEADING ON" > $SQL_FILE
-    echo "SELECT BIN, TRACKING, BATCH, COUNT(*) FROM esp.card WHERE TRIM(BIN)='$BIN_INPUT' GROUP BY BIN, TRACKING, BATCH;" >> $SQL_FILE
-    echo "EXIT;" >> $SQL_FILE
-    
-    sqlplus -S $DB_CONNString @$SQL_FILE
-
-    echo ""
-    read -p "¿Desea revertir todos los registros con TRACKING 'K' a 'P' para este BIN? (S/N): " CONFIRM
-    
-    if [[ "$CONFIRM" != "S" && "$CONFIRM" != "s" ]]; then
-        echo "Cancelado."
-        return
-    fi
-
-    # 2. Ejecutar el Update Inverso (Rollback manual)
-    echo "Realizando Rollback..."
-    echo "UPDATE esp.card SET TRACKING = 'P'" > $SQL_FILE
-    echo "WHERE TRIM(BIN) = '$BIN_INPUT'" >> $SQL_FILE
-    echo "AND TRACKING = 'K';" >> $SQL_FILE
-    echo "COMMIT;" >> $SQL_FILE
-    
-    # 3. Mostrar resultado final
-    echo "PROMPT Estado final:" >> $SQL_FILE
-    echo "SELECT BIN, TRACKING, BATCH, COUNT(*) FROM esp.card WHERE TRIM(BIN)='$BIN_INPUT' GROUP BY BIN, TRACKING, BATCH;" >> $SQL_FILE
-    echo "EXIT;" >> $SQL_FILE
-
-    sqlplus -S $DB_CONNString @$SQL_FILE
-
-    read -p "Rollback finalizado. Presione Enter para volver."
-}
-
-# ==========================================
-# BUCLE PRINCIPAL
-# ==========================================
-while true; do
-    show_menu
-    case $OPCION in
-        1) do_process ;;
-        2) do_rollback ;;
-        3) echo "Saliendo..."; exit 0 ;;
-        *) echo "Opción no válida." ;;
-    esac
-done
