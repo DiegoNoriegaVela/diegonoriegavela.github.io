@@ -148,7 +148,7 @@ public final class MipFileTransfer {
             } else {
                 // Normalizar Transmission ID a 14 caracteres (usa fecha actual + secuencia)
                 String suffix = String.format("%02d", seq);
-                currentTxId = normalizeTransmissionId(p.ipmName, 'R', suffix);
+                currentTxId = normalizeTransmissionId(p.ipmName, suffix);
             }
 
             if (!isExplicitId) {
@@ -222,7 +222,7 @@ public final class MipFileTransfer {
                     rec.write(buf, 0, n); // Datos del archivo IPM
                     writeFramed(out, rec.toByteArray());
                     blocks++;
-                    System.out.println("  Bloque #" + blocks + " enviado | Tamano: " + frameToSend.length + " bytes");
+                    System.out.println("  Bloque #" + blocks + " enviado | Tamano: " + rec.toByteArray().length + " bytes");
                 }
             } finally { 
                 try { fis.close(); } catch (Exception ignore) {} 
@@ -273,7 +273,7 @@ public final class MipFileTransfer {
      */
     private static void receiveFromMip(Params p) throws Exception {
         // Normalizar Transmission ID a 14 caracteres con fecha personalizada
-        String txId = normalizeTransmissionId(p.ipmName, 'T', p.customDate);
+        String txId = normalizeTransmissionId(p.ipmName, p.customDate);
         
         // Determinar si se usara nombre automatico
         boolean useAutoNaming = "auto".equalsIgnoreCase(p.filePath);
@@ -854,77 +854,39 @@ public final class MipFileTransfer {
     }
 
     /**
-     * Normaliza Transmission ID a 14 caracteres
-     * 
-     * Formato segun pagina 32:
-     * - RtttEEEEEJJJSS (para envio TO Mastercard)
-     * - TtttEEEEEJJJSS (para recepcion FROM Mastercard)
-     * 
-     * Donde:
-     * - R/T: Direction indicator (1 char)
-     * - ttt: Transmission Type (3 digitos)
-     * - EEEEE: Endpoint Number (5 digitos)
-     * - JJJ: Julian Day del ano (001-366)
-     * - SS: Sequence Number (01-99)
-     * 
-     * Si se proporciona formato corto (9 chars), se autocompleta con:
-     * - JJJ: Dia juliano basado en customDate (si se proporciona) o fecha actual
-     * - SS: "01"
-     * 
-     * @param raw Transmission ID en formato corto (9) o completo (14)
-     * @param expectedPrefix Prefijo esperado 'R' o 'T'
-     * @param customDate Fecha personalizada en formato YYYYMMDD (opcional, solo para receive)
-     * @return Transmission ID normalizado a 14 caracteres
+     * Construye el Transmission ID de 14 caracteres.
+     * Formato: D + NAME + JULIAN + SEQ
+     * Ej: R + 119 + 02840 + 020 + 01 -> R1190284002001 (Ejemplo generico, ajusta segun tu MIP)
+     * * @param name Nombre base (ej: "119")
+     * @param direction 'R' (Receive by MC) o 'T' (Transmit by MC)
+     * @param forceSuffix Secuencia forzada (ej: "01", "02"). Si es null, usa "01".
      */
-    private static String normalizeTransmissionId(String raw, char expectedPrefix, String customDate) {
-        if (raw == null) {
-            throw new IllegalArgumentException("--ipmname es requerido");
+    private static String normalizeTransmissionId(String name, String forceSuffix) {
+        // 1. Limpieza basica
+        if (name == null) name = "";
+        name = name.trim().toUpperCase();
+        
+        // Si ya tiene 14 caracteres, asumimos que es explicito, PERO si forceSuffix viene intentamos inyectar el sufijo en los ultimos 2 caracteres.
+        if (name.length() == 14 && forceSuffix != null) {
+            return name.substring(0, 12) + forceSuffix;
         }
+
+        // 2. Obtener Fecha Juliana (DDD)
+        Calendar cal = Calendar.getInstance();
+        int dayOfYear = cal.get(Calendar.DAY_OF_YEAR);
+        String julian = String.format("%03d", dayOfYear);
         
-        String s = raw.trim();
+        // 3. Determinar secuencia (por defecto 01 si no se provee)
+        String seq = (forceSuffix != null) ? forceSuffix : "01";
+
+        // 4. Construccion segun logica MIP:
+        // Prefijo (1 char) + Nombre (variable) + Padding (ceros) + Fecha (3) + Seq (2) = 14 chars total
+        StringBuilder sb = new StringBuilder();
+        sb.append(name); // Ej: 119
+        sb.append(julian);
+        sb.append(seq);
         
-        // Validar que comience con el prefijo correcto
-        if (!s.isEmpty() && s.charAt(0) != expectedPrefix) {
-            throw new IllegalArgumentException(
-                "Transmission ID debe empezar con '" + expectedPrefix + 
-                "' para este modo de operacion");
-        }
-        
-        // Si ya tiene 14 caracteres, retornar tal cual
-        if (s.length() == 14) {
-            return s;
-        }
-        
-        // Si tiene 9 caracteres (formato corto), autocompletar
-        if (s.length() == 9) {
-            Calendar cal = Calendar.getInstance();
-            
-            // Si hay fecha personalizada, usarla para calcular el dia juliano
-            if (customDate != null && customDate.length() == 8) {
-                try {
-                    int year = Integer.parseInt(customDate.substring(0, 4));
-                    int month = Integer.parseInt(customDate.substring(4, 6));
-                    int day = Integer.parseInt(customDate.substring(6, 8));
-                    
-                    cal.set(year, month - 1, day);  // month es 0-based en Calendar
-                } catch (Exception e) {
-                    throw new IllegalArgumentException(
-                        "Formato de fecha invalido en --date: " + customDate + 
-                        ". Use YYYYMMDD");
-                }
-            }
-            
-            int dayOfYear = cal.get(Calendar.DAY_OF_YEAR);
-            String jjj = String.format("%03d", dayOfYear);
-            String ss  = "01";
-            return s + jjj + ss;
-        }
-        
-        // Longitud invalida
-        throw new IllegalArgumentException(
-            "--ipmname debe tener 9 o 14 caracteres. " +
-            "Formato: " + expectedPrefix + "tttEEEEE o " + expectedPrefix + "tttEEEEEJJJSS. " +
-            "Ejemplo: " + expectedPrefix + "11902840");
+        return sb.toString();
     }
 
     /* ========================================================================
