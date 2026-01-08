@@ -1,226 +1,71 @@
-# ==========================================
-# CONFIGURACION DEL PROCESO CRYPT CBC TO PGP
-# ==========================================
+    /**
+     * Construye el Transmission ID de 14 caracteres.
+     * Formato: Direction(1) + Name(Variable) + Padding(0) + Julian(3) + Seq(2)
+     * * Ejemplo:
+     * - Input: Name="119", Date="20250201" (1 de Feb), Seq="01"
+     * - Julian: 1 de Feb es el dia 032 del año.
+     * - Output: R119000003201
+     * * @param name Nombre base (ej: "119")
+     * @param direction 'R' (Receive by MC) o 'T' (Transmit by MC)
+     * @param forceSuffix Secuencia forzada (ej: "01", "02"). Si es null, usa "01".
+     * @param customDate Fecha en formato "YYYYMMDD". Si es null, usa fecha actual.
+     */
+    private static String normalizeTransmissionId(String name, char direction, String forceSuffix, String customDate) {
+        // 1. Limpieza basica
+        if (name == null) name = "";
+        name = name.trim().toUpperCase();
+        
+        // Si ya tiene 14 caracteres (ID Explicito), solo inyectamos el sufijo si se pide
+        if (name.length() == 14) {
+            if (forceSuffix != null) {
+                return name.substring(0, 12) + forceSuffix;
+            }
+            return name;
+        }
 
-# --- Configuracion General ---
-PGP_BIN="/opt/pgp/bin/pgp"
+        // 2. Calculo de Fecha Juliana (DDD)
+        Calendar cal = Calendar.getInstance();
+        
+        // Si nos pasaron una fecha especifica (YYYYMMDD), la parseamos
+        if (customDate != null && customDate.matches("\\d{8}")) {
+            try {
+                int year = Integer.parseInt(customDate.substring(0, 4));
+                int month = Integer.parseInt(customDate.substring(4, 6)) - 1; // Calendar usa meses 0-11
+                int day = Integer.parseInt(customDate.substring(6, 8));
+                cal.set(year, month, day);
+            } catch (Exception e) {
+                System.out.println("(Warn) Formato de fecha invalido: " + customDate + ". Usando fecha actual.");
+            }
+        }
+        
+        // Obtener el dia del anio (1 al 366)
+        int dayOfYear = cal.get(Calendar.DAY_OF_YEAR);
+        String julian = String.format("%03d", dayOfYear);
+        
+        // 3. Determinar secuencia (por defecto 01 si no se provee)
+        String seq = (forceSuffix != null) ? forceSuffix : "01";
 
-# --- Destino Final (NFS - IZIPAY) ---
-# Los archivos generados iran DIRECTAMENTE aqui.
-PATH_NFS_OUT="/nfshomedesa/usftp138/OUT/"
-
-# --- Credenciales SFTP AS400 ---
-SFTP_USER="usddsad"
-SFTP_IP="10.10.10.10"
-SFTP_KEY="/home/usddsad/.ssh/id_rsa"
-
-# --- 1. Configuracion Propiedades (Llaves) ---
-REMOTE_DIR_PROPS="/Cifrado_OPENSSL/EPM/Project/properties"
-REMOTE_FILE_PROPS="props.properties"
-
-# --- 2. Configuracion Datos (Input Encriptado) ---
-REMOTE_DIR_INPUT="/home/usddsad/input_files/encrypted"
-REMOTE_FILE_INPUT="LTAX1451.enc"
-
-# --- Configuracion PGP (Salida) ---
-PGP_RECIPIENT="seginfo@izipay.pe"
-OUTPUT_FILENAME_PREFIX="LTAX1451"
-OUTPUT_CONTROL_PREFIX="ECTRL10925"
-
-# --- Nombres Internos (Temporales) ---
-TEMP_PROP_FILE="props.properties"
-TEMP_DEC_FILE="LTAX1451.txt"
-
------
-
-#!/bin/bash
-set -eou pipefail
-
-# ==============================================================================
-# SCRIPT: cryptCbcToPgp.sh
-# DESCRIPCION: Procesa archivos desde AS400 y entrega directamente en NFS.
-#              No genera backups locales en carpeta OUT.
-# ==============================================================================
-
-# 1. Obtener directorio local absoluto
-DIR_LOCAL="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
-
-# 2. Cargar configuracion
-CONFIG_FILE="${DIR_LOCAL}/config.ini"
-
-if [ ! -f "$CONFIG_FILE" ]; then
-    echo "Error: No se encuentra el archivo de configuracion $CONFIG_FILE"
-    exit 1
-fi
-
-# shellcheck source=config.ini
-source "$CONFIG_FILE"
-
-# 3. Definicion de variables
-DATE_YYMMDD=$(date +'%y%m%d')
-
-# Directorio temporal de trabajo (Unica carpeta local necesaria)
-DIR_TMP="${DIR_LOCAL}/tmp"
-
-# Rutas de archivos temporales
-FILE_LOCAL_IFS="${DIR_TMP}/${TEMP_PROP_FILE}"
-DEC_FILE="${DIR_TMP}/${TEMP_DEC_FILE}"
-IN_ENC_FILE="${DIR_TMP}/${REMOTE_FILE_INPUT}"
-
-# --- RUTAS DE SALIDA (DIRECTO A NFS) ---
-# Se construyen las rutas finales apuntando a la carpeta compartida
-FINAL_PGP_NAME="${OUTPUT_FILENAME_PREFIX}${DATE_YYMMDD}.txt.pgp"
-FINAL_CTL_NAME="${OUTPUT_CONTROL_PREFIX}${DATE_YYMMDD}.fin"
-
-OUT_PGP_FILE="${PATH_NFS_OUT}/${FINAL_PGP_NAME}"
-OUT_CONTROL_FILE="${PATH_NFS_OUT}/${FINAL_CTL_NAME}"
-
-# ==============================================================================
-# FUNCIONES
-# ==============================================================================
-
-log() {
-    while IFS= read -r line; do
-        echo "$(date +'%Y-%m-%d %H:%M:%S') - $line"
-    done
-}
-
-preparar_entorno() {
-    echo "--- PASO 0: Preparacion del entorno ---"
-    
-    # 1. Crear carpeta temporal local si no existe
-    if mkdir -p "$DIR_TMP"; then
-        echo "Directorio temporal verificado: $DIR_TMP"
-    else
-        echo "Error: No se pudo crear el directorio temporal."
-        return 1
-    fi
-
-    # 2. Verificar acceso a carpeta NFS (Destino Final)
-    if [ ! -d "$PATH_NFS_OUT" ]; then
-        echo "Error Critico: El directorio NFS $PATH_NFS_OUT no es accesible."
-        return 1
-    fi
-
-    # 3. LIMPIEZA PREVIA DE NFS
-    # Como escribiremos directo, limpiamos antes de empezar el proceso de encriptado
-    echo "Limpiando directorio NFS destino ($PATH_NFS_OUT)..."
-    rm -f "${PATH_NFS_OUT:?}"/*
-    echo "Directorio NFS limpio."
-}
-
-check_remote_dir() {
-    local dir_to_check="$1"
-    echo "Verificando ruta remota SFTP: $dir_to_check ..."
-    
-    VERIF_REMOTE=$(sftp -i "$SFTP_KEY" -oBatchMode=yes -oStrictHostKeyChecking=no "${SFTP_USER}@${SFTP_IP}" 2>&1 <<EOF
-cd $dir_to_check
-exit
-EOF
-)
-    if echo "$VERIF_REMOTE" | grep -Eqi "No such file|not found"; then
-        echo "Error: El directorio remoto '$dir_to_check' no existe."
-        return 1
-    fi
-}
-
-get_files_as400() {
-    echo "--- PASO 1: Descarga de archivos desde AS400 ---"
-
-    check_remote_dir "$REMOTE_DIR_PROPS"
-    check_remote_dir "$REMOTE_DIR_INPUT"
-
-    echo "Descargando propiedades y archivo encriptado..."
-    if sftp -i "$SFTP_KEY" -oBatchMode=yes -oStrictHostKeyChecking=no "${SFTP_USER}@${SFTP_IP}" <<EOF >/dev/null 2>&1
-lcd $DIR_TMP
-cd $REMOTE_DIR_PROPS
-get $REMOTE_FILE_PROPS
-cd $REMOTE_DIR_INPUT
-get $REMOTE_FILE_INPUT
-bye
-EOF
-    then
-        echo "Archivos descargados correctamente en TMP."
-    else
-        echo "Error: Fallo la descarga SFTP."
-        return 1
-    fi
-}
-
-obtener_key_iv() {
-    echo "--- PASO 2: Extraccion de credenciales ---"
-    if [ ! -f "$FILE_LOCAL_IFS" ]; then
-        echo "Error: No se encontro el archivo de propiedades."
-        return 1
-    fi
-    KEY_AES=$(sed -n '1p' "$FILE_LOCAL_IFS" | tr -d '\n\r ')
-    IV_AES=$(sed -n '2p' "$FILE_LOCAL_IFS" | tr -d '\n\r ')
-    
-    if [ -z "$KEY_AES" ] || [ -z "$IV_AES" ]; then
-        echo "Error: Credenciales vacias."
-        return 1
-    fi
-}
-
-desencriptar_archivo() {
-    echo "--- PASO 3: Desencriptado AES (Local TMP) ---"
-    if [ ! -f "$IN_ENC_FILE" ]; then
-        echo "Error: Falta archivo input."
-        return 1
-    fi
-
-    # NOTA: Se usa -k (minuscula) para indicar Passphrase (contraseña)
-    openssl enc -d -aes-256-cbc -k "$KEY_AES" -iv "$IV_AES" -in "$IN_ENC_FILE" -out "$DEC_FILE"
-
-    if [ $? -eq 0 ]; then
-        echo "Desencriptado correcto."
-    else
-        echo "Error: Fallo openssl (bad decrypt). Revise la contraseña."
-        return 1
-    fi
-}
-
-encriptar_y_control_nfs() {
-    echo "--- PASO 4: Encriptado PGP y Entrega a NFS ---"
-    
-    # 1. Encriptar directo al NFS
-    echo "Generando archivo PGP en ruta NFS: $OUT_PGP_FILE"
-    "$PGP_BIN" --encrypt --recipient "$PGP_RECIPIENT" --input "$DEC_FILE" --output "$OUT_PGP_FILE" --always-trust
-
-    if [ $? -ne 0 ]; then
-        echo "Error al generar archivo PGP en NFS."
-        return 1
-    fi
-
-    # 2. Generar control directo al NFS
-    echo "Generando archivo de control en NFS..."
-    local count
-    count=$(wc -l < "$DEC_FILE" | xargs)
-    
-    echo "Registros: $count" > "$OUT_CONTROL_FILE"
-    echo "Archivos entregados exitosamente en NFS."
-}
-
-limpiar_temporales() {
-    echo "Limpiando directorio TMP local..."
-    rm -rf "$DIR_TMP"
-}
-
-# ==============================================================================
-# MAIN
-# ==============================================================================
-
-main() {
-    echo "=== INICIO PROCESO EN $(hostname) ==="
-
-    preparar_entorno        # Crea tmp y limpia NFS destino
-    get_files_as400         # Descarga todo
-    obtener_key_iv          # Lee llaves
-    desencriptar_archivo    # Desencripta en tmp
-    encriptar_y_control_nfs # Escribe resultado final en NFS
-    limpiar_temporales      # Borra tmp
-
-    echo "=== FIN PROCESO EXITOSO ==="
-}
-
-main 2>&1 | log
+        // 4. Construccion del ID segun logica MIP
+        StringBuilder sb = new StringBuilder();
+        sb.append(direction); // Ej: R
+        
+        // Limpiar prefijos R/T del nombre si el usuario los puso por error (ej: R119 -> 119)
+        if (name.startsWith("R") || name.startsWith("T")) {
+             if (name.length() > 1 && Character.isDigit(name.charAt(1))) {
+                 name = name.substring(1);
+             }
+        }
+        sb.append(name); 
+        
+        // Rellenar con ceros (Padding) hasta completar longitud
+        // Meta: 14 chars. Tenemos ocupados: 1(Dir) + 3(Julian) + 2(Seq) = 6 fijos.
+        // El resto es para el Nombre y los Ceros.
+        while (sb.length() + 3 + 2 < 14) {
+            sb.append("0");
+        }
+        
+        sb.append(julian);
+        sb.append(seq);
+        
+        return sb.toString();
+    }
