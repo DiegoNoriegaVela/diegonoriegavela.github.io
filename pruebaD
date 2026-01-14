@@ -1,71 +1,58 @@
-    /**
-     * Construye el Transmission ID de 14 caracteres.
-     * Formato: Direction(1) + Name(Variable) + Padding(0) + Julian(3) + Seq(2)
-     * * Ejemplo:
-     * - Input: Name="119", Date="20250201" (1 de Feb), Seq="01"
-     * - Julian: 1 de Feb es el dia 032 del año.
-     * - Output: R119000003201
-     * * @param name Nombre base (ej: "119")
-     * @param direction 'R' (Receive by MC) o 'T' (Transmit by MC)
-     * @param forceSuffix Secuencia forzada (ej: "01", "02"). Si es null, usa "01".
-     * @param customDate Fecha en formato "YYYYMMDD". Si es null, usa fecha actual.
-     */
-    private static String normalizeTransmissionId(String name, char direction, String forceSuffix, String customDate) {
-        // 1. Limpieza basica
-        if (name == null) name = "";
-        name = name.trim().toUpperCase();
-        
-        // Si ya tiene 14 caracteres (ID Explicito), solo inyectamos el sufijo si se pide
-        if (name.length() == 14) {
-            if (forceSuffix != null) {
-                return name.substring(0, 12) + forceSuffix;
-            }
-            return name;
-        }
+// Método de ENCRIPTACIÓN modificado
+// Ahora recibe el parámetro charsetName (ej. "UTF-8", "ISO-8859-1", "Windows-1252")
+public static void encryptContentFile(String iPath, String oPath, String key, String charsetName) throws EncryptionException {
+    try {
+        // 1. Obtenemos el objeto Charset a partir del nombre recibido
+        Charset charset = Charset.forName(charsetName);
 
-        // 2. Calculo de Fecha Juliana (DDD)
-        Calendar cal = Calendar.getInstance();
-        
-        // Si nos pasaron una fecha especifica (YYYYMMDD), la parseamos
-        if (customDate != null && customDate.matches("\\d{8}")) {
-            try {
-                int year = Integer.parseInt(customDate.substring(0, 4));
-                int month = Integer.parseInt(customDate.substring(4, 6)) - 1; // Calendar usa meses 0-11
-                int day = Integer.parseInt(customDate.substring(6, 8));
-                cal.set(year, month, day);
-            } catch (Exception e) {
-                System.out.println("(Warn) Formato de fecha invalido: " + customDate + ". Usando fecha actual.");
-            }
-        }
-        
-        // Obtener el dia del anio (1 al 366)
-        int dayOfYear = cal.get(Calendar.DAY_OF_YEAR);
-        String julian = String.format("%03d", dayOfYear);
-        
-        // 3. Determinar secuencia (por defecto 01 si no se provee)
-        String seq = (forceSuffix != null) ? forceSuffix : "01";
+        // 2. Usamos ese charset para LEER el archivo de entrada
+        String fileContent = Files.readString(Paths.get(iPath), charset);
 
-        // 4. Construccion del ID segun logica MIP
-        StringBuilder sb = new StringBuilder();
-        sb.append(direction); // Ej: R
-        
-        // Limpiar prefijos R/T del nombre si el usuario los puso por error (ej: R119 -> 119)
-        if (name.startsWith("R") || name.startsWith("T")) {
-             if (name.length() > 1 && Character.isDigit(name.charAt(1))) {
-                 name = name.substring(1);
-             }
-        }
-        sb.append(name); 
-        
-        // Rellenar con ceros (Padding) hasta completar longitud
-        // Meta: 14 chars. Tenemos ocupados: 1(Dir) + 3(Julian) + 2(Seq) = 6 fijos.
-        // El resto es para el Nombre y los Ceros.
-        while (sb.length() + 3 + 2 < 14) {
-            sb.append("0");
-        }
-        
-        sb.append(julian);
-        sb.append(seq);
-        
-        return sb.toString();
+        AESGCMCipher aesgcmCipher = new AESGCMCipher();
+        // Ciframos el contenido (esto sigue siendo igual)
+        String encryptedContent = aesgcmCipher.encrypt(fileContent, key);
+
+        // 3. IMPORTANTE: Usamos el MISMO charset para ESCRIBIR el archivo de salida.
+        // Si lo leíste en ANSI, es buena práctica escribirlo igual para mantener consistencia,
+        // aunque podrías forzar UTF-8 aquí si quisieras estandarizar la salida.
+        // He simplificado las opciones de escritura a las estándar de Java NIO.
+        Files.writeString(Paths.get(oPath), encryptedContent, charset, 
+                          StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING);
+
+        System.out.println("Cifrado exitoso: " + iPath + " -> " + oPath);
+
+    } catch (IOException e) {
+        throw new EncryptionException("Error de E/S al leer/escribir el archivo: " + iPath + ". Verifica permisos o rutas.", e);
+    } catch (Exception e) {
+        // Capturamos Exception general para atrapar errores de cifrado Y errores si el nombre del charset es inválido.
+        throw new EncryptionException("Error durante el proceso (posible charset inválido o error de cifrado): " + iPath + ". Charset usado: " + charsetName, e);
     }
+}
+
+
+// Método de DESENCRIPTACIÓN modificado
+public static void decryptContentFile(String iPath, String oPath, String key, String charsetName) throws EncryptionException {
+    try {
+        // 1. Obtenemos el Charset
+        Charset charset = Charset.forName(charsetName);
+
+        // 2. Leemos el archivo cifrado usando ese charset
+        String fileContent = Files.readString(Paths.get(iPath), charset);
+
+        AESGCMCipher aesgcmCipher = new AESGCMCipher();
+        // Desciframos
+        String decryptedContent = aesgcmCipher.decrypt(fileContent, key);
+
+        // 3. Escribimos el resultado usando el mismo charset para recuperar los caracteres originales (ñ, $, etc.)
+        Files.writeString(Paths.get(oPath), decryptedContent, charset, 
+                          StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING);
+                          
+        System.out.println("Descifrado exitoso: " + iPath + " -> " + oPath);
+
+    } catch (IOException e) {
+         throw new EncryptionException("Error de E/S al leer/escribir el archivo: " + iPath, e);
+    } catch (Exception e) {
+        // Capturamos Exception general por si el nombre del charset es malo o falla el descifrado.
+        throw new EncryptionException("Error al descifrar o charset inválido: " + iPath + ". Verifica que la llave y el charset (" + charsetName + ") sean correctos.", e);
+    }
+}
