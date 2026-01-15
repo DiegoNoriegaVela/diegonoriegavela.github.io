@@ -21,7 +21,7 @@ import java.util.*;
  *   3. Recibe bloques de datos
  *   4. Convierte de EBCDIC a ASCII y guarda
  * 
- * @version 4.0
+ * @version 4.1
  */
 public final class MipFileTransfer {
 
@@ -79,6 +79,8 @@ public final class MipFileTransfer {
         System.out.println("Archivo        : " + f.getName());
         System.out.println("Tamano         : " + f.length() + " bytes");
         System.out.println("MIP            : " + p.ip + ":" + p.port);
+        System.out.println("IPM Name       : " + p.ipmName);
+        System.out.println("Fecha          : " + p.date);
         System.out.println("==============================================");
 
         // 1. Leer archivo
@@ -106,40 +108,47 @@ public final class MipFileTransfer {
 
             // 5. FASE 1: Buscar secuencia valida para el Header
             String txIdAceptado = null;
+            String lastRawResponse = "";
             
-            System.out.println("[FASE 1] Consultando Header...");
+            System.out.println("[FASE 1] Consultando Header 004...");
+            System.out.println("  Buscando secuencia disponible desde " + String.format("%02d", seqInicial) + "...\n");
             
             for (int seq = seqInicial; seq <= MAX_SEQ; seq++) {
                 String seqStr = String.format("%02d", seq);
                 String txId = buildTransmissionId(p.ipmName, p.date, seqStr);
                 String header = buildHeader004(txId);
                 
+                System.out.println("  [Seq " + seqStr + "] Solicitando: " + txId);
+                
                 // Enviar Header
                 outSocket(client, header.getBytes());
                 
                 // Leer respuesta
                 String resp = inSocket(client).trim();
+                lastRawResponse = resp;
                 
                 // Analizar respuesta
-                McResponse mcResp = checkMcResponse("Consulta Header ", resp);
+                McResponse mcResp = checkMcResponse(resp);
                 
                 if (mcResp.isAccepted) {
                     txIdAceptado = txId;
-                    System.out.println("  Secuencia " + seqStr + ": ACEPTADO");
-                    System.out.println("  Transmission ID: " + txIdAceptado);
+                    System.out.println("           -> ACEPTADO\n");
                     break;
                 } else if (mcResp.isDuplicate) {
-                    System.out.println("  Secuencia " + seqStr + ": DUPLICADO (ya enviado)");
-                    // Continuar con siguiente secuencia
+                    System.out.println("           -> DUPLICADO (ya enviado), probando siguiente...");
                 } else {
-                    System.out.println("  Secuencia " + seqStr + ": RECHAZADO (" + mcResp.errorCode + ")");
-                    // Continuar con siguiente secuencia
+                    System.out.println("           -> RECHAZADO (RC=" + mcResp.returnCode + "), probando siguiente...");
                 }
             }
             
             if (txIdAceptado == null) {
-                throw new IOException("No se encontro secuencia disponible (" + seqInicial + " - " + MAX_SEQ + " agotadas)");
+                System.err.println("\nERROR: No se encontro secuencia disponible");
+                System.err.println("  Rango intentado: " + String.format("%02d", seqInicial) + " - " + MAX_SEQ);
+                System.err.println("  Ultima respuesta MIP: " + lastRawResponse);
+                throw new IOException("Secuencias agotadas (" + seqInicial + "-" + MAX_SEQ + ")");
             }
+            
+            System.out.println("  Transmission ID aceptado: " + txIdAceptado);
 
             // 6. FASE 2: Enviar bloques de datos
             System.out.println("\n[FASE 2] Enviando bloques de datos...");
@@ -153,21 +162,27 @@ public final class MipFileTransfer {
             }
 
             // 7. FASE 3: Enviar Trailer 998
-            System.out.println("\n[FASE 3] Enviando Trailer...");
+            System.out.println("\n[FASE 3] Enviando Trailer 998...");
+            System.out.println("  Block count: " + (dataBlocks.size() + 1) + " (datos + trailer)");
+            
             outSocket(client, buildTrailer998(dataBlocks.size()));
             
             // 8. Esperar confirmacion final
             String respFinal = inSocket(client).trim();
-            McResponse mcRespFinal = checkMcResponse("Trailer", respFinal);
+            McResponse mcRespFinal = checkMcResponse(respFinal);
+            
+            System.out.println("  Respuesta MIP: " + respFinal);
             
             if (mcRespFinal.isAccepted) {
                 System.out.println("\n==============================================");
                 System.out.println("ENVIO COMPLETADO EXITOSAMENTE");
-                System.out.println("Transmission ID: " + txIdAceptado);
+                System.out.println("==============================================");
+                System.out.println("Transmission ID : " + txIdAceptado);
                 System.out.println("Bloques enviados: " + (dataBlocks.size() + 1));
                 System.out.println("==============================================");
             } else {
-                throw new IOException("Trailer rechazado: " + mcRespFinal.errorCode);
+                System.err.println("  -> RECHAZADO");
+                throw new IOException("Trailer rechazado por MIP: " + respFinal);
             }
 
         } finally {
@@ -183,8 +198,10 @@ public final class MipFileTransfer {
         System.out.println("==============================================");
         System.out.println("MIP FILE TRANSFER - RECEIVE (FROM MASTERCARD)");
         System.out.println("==============================================");
-        System.out.println("Destino        : " + p.filePath);
+        System.out.println("Archivo salida : " + p.filePath);
         System.out.println("MIP            : " + p.ip + ":" + p.port);
+        System.out.println("IPM Name       : " + p.ipmName);
+        System.out.println("Fecha          : " + p.date);
         System.out.println("==============================================");
 
         // 1. Conectar al MIP
@@ -201,15 +218,19 @@ public final class MipFileTransfer {
 
         StringBuilder contenido = new StringBuilder();
         String txIdEncontrado = null;
+        String lastRawResponse = "";
 
         try {
             // 3. FASE 1: Buscar archivo con Request 101
-            System.out.println("[FASE 1] Buscando archivo...");
+            System.out.println("[FASE 1] Buscando archivo en MIP...");
+            System.out.println("  Buscando secuencia desde " + String.format("%02d", seqInicial) + "...\n");
 
             for (int seq = seqInicial; seq <= MAX_SEQ; seq++) {
                 String seqStr = String.format("%02d", seq);
                 String txId = buildTransmissionId(p.ipmName, p.date, seqStr);
                 String request = buildRequest101(txId);
+
+                System.out.println("  [Seq " + seqStr + "] Solicitando: " + txId);
 
                 // Enviar Request
                 outSocket(client, request.getBytes());
@@ -226,28 +247,34 @@ public final class MipFileTransfer {
                         moreData = false;
                     }
                 }
+                
+                lastRawResponse = contenido.toString().trim();
 
                 // Verificar si encontro el archivo
                 if (contenido.indexOf("9980100") >= 0) {
                     txIdEncontrado = txId;
-                    System.out.println("  Secuencia " + seqStr + ": ENCONTRADO");
-                    System.out.println("  Transmission ID: " + txIdEncontrado);
+                    System.out.println("           -> ENCONTRADO\n");
                     break;
                 } else {
-                    if (seq <= 3 || seq % 10 == 0) {
-                        System.out.println("  Secuencia " + seqStr + ": No encontrado");
-                    }
+                    // Mostrar cada intento (uno por uno)
+                    System.out.println("           -> No encontrado");
                 }
             }
 
             if (txIdEncontrado == null) {
-                throw new IOException("No se encontro secuencia disponible (" + seqInicial + " - " + MAX_SEQ + " agotadas)");
+                System.err.println("\nERROR: Archivo no encontrado en MIP");
+                System.err.println("  Rango intentado: " + String.format("%02d", seqInicial) + " - " + MAX_SEQ);
+                System.err.println("  Ultima respuesta MIP: " + lastRawResponse);
+                throw new IOException("Archivo no encontrado (secuencias " + seqInicial + "-" + MAX_SEQ + " agotadas)");
             }
+            
+            System.out.println("  Transmission ID encontrado: " + txIdEncontrado);
 
             // 4. FASE 2: Procesar y guardar contenido
-            System.out.println("\n[FASE 2] Guardando archivo...");
+            System.out.println("\n[FASE 2] Procesando y guardando archivo...");
             
             String data = processReceivedData(contenido.toString());
+            int dataLength = data.length();
 
             // Escribir con header del nombre
             StringBuilder output = new StringBuilder();
@@ -255,10 +282,14 @@ public final class MipFileTransfer {
             output.append(data);
 
             writeToFile(p.filePath, output.toString());
+            
+            System.out.println("  Datos recibidos: " + dataLength + " caracteres");
 
             System.out.println("\n==============================================");
-            System.out.println("RECEPCION COMPLETADA");
-            System.out.println("Archivo: " + p.filePath);
+            System.out.println("RECEPCION COMPLETADA EXITOSAMENTE");
+            System.out.println("==============================================");
+            System.out.println("Transmission ID : " + txIdEncontrado);
+            System.out.println("Archivo guardado: " + p.filePath);
             System.out.println("==============================================");
 
         } finally {
@@ -272,7 +303,17 @@ public final class MipFileTransfer {
     
     /**
      * Construye el Transmission ID de 14 caracteres.
-     * Formato: ipmName (9 chars) + Julian Day (3 chars) + Sequence (2 chars)
+     * 
+     * Formato segun pagina 32 del Manual:
+     *   RtttEEEEEJJJSS (para envio TO Mastercard)
+     *   TtttEEEEEJJJSS (para recepcion FROM Mastercard)
+     * 
+     * Donde:
+     *   R/T   : Direction indicator (1 char)
+     *   ttt   : Transmission Type (3 digitos)
+     *   EEEEE : Endpoint Number (5 digitos)
+     *   JJJ   : Julian Day del ano (001-366)
+     *   SS    : Sequence Number (01-99)
      * 
      * @param ipmName Nombre base (9 chars) o completo (14 chars)
      * @param date Fecha YYYYMMDD para calcular dia Juliano
@@ -351,7 +392,7 @@ public final class MipFileTransfer {
         return "101" + "01" + txId;
     }
 
-/**
+    /**
      * Construye Trailer 998 - Pagina 50 del Manual
      * 
      * Estructura (11 bytes total):
@@ -360,25 +401,31 @@ public final class MipFileTransfer {
      *   pos 6-7  : Return Code "00" (2 bytes) - "00" = OK
      *   pos 8-11 : Number of Blocks (4 bytes Big-Endian)
      * 
+     * Nota: El block count (pos 8-11) se envia como binario puro,
+     * NO se convierte a EBCDIC.
+     * 
      * @param dataBlockCount Cantidad de bloques de datos enviados
      * @return Trailer como byte[] (11 bytes)
      */
     private static byte[] buildTrailer998(int dataBlockCount) {
         byte[] trailer = new byte[11];
         
+        // pos 1-7: "9980100" en ASCII
         byte[] prefix = "9980100".getBytes();
         System.arraycopy(prefix, 0, trailer, 0, 7);
         
-        // Block count = dataBlocks + 1 (incluye el trailer)
+        // pos 8-11: Block count (Big-Endian, incluye el trailer)
         int totalCount = dataBlockCount + 1;
-        byte[] countBytes = intToBytesBE(totalCount, 4);
-        System.arraycopy(countBytes, 0, trailer, 7, 4);
+        trailer[7] = (byte) ((totalCount >> 24) & 0xFF);
+        trailer[8] = (byte) ((totalCount >> 16) & 0xFF);
+        trailer[9] = (byte) ((totalCount >> 8) & 0xFF);
+        trailer[10] = (byte) (totalCount & 0xFF);
         
         return trailer;
     }
 
     // ========================================================================
-    // PARTICIONADO DE ARCHIVO (solo datos, sin trailer)
+    // PARTICIONADO DE ARCHIVO
     // ========================================================================
     
     /**
@@ -420,17 +467,6 @@ public final class MipFileTransfer {
     private static class McResponse {
         boolean isAccepted = false;
         boolean isDuplicate = false;
-        String errorCode = "";
-        String rawResponse = "";
-    }
-    
-
-    /**
-     * Clase para encapsular la respuesta del MIP
-     */
-    private static class McResponse {
-        boolean isAccepted = false;
-        boolean isDuplicate = false;
         String requestCode = "";   // "998", "004", etc.
         String recordType = "";    // "01", "6A", etc.
         String returnCode = "";    // "00" = OK, otros = error
@@ -450,32 +486,24 @@ public final class MipFileTransfer {
      *   9980101 : Error generico
      *   9288W   : Archivo duplicado (ya enviado anteriormente)
      * 
-     * @param stage Nombre de la etapa (para logging)
      * @param response Respuesta recibida del MIP (ya convertida a ASCII)
      * @return McResponse con el resultado del analisis
      */
-    private static McResponse checkMcResponse(String stage, String response) {
+    private static McResponse checkMcResponse(String response) {
         McResponse result = new McResponse();
         result.rawResponse = response;
         
-        System.out.println("  [" + stage + "]");
-        System.out.println("    Respuesta MIP: " + response);
-        
-        // Caso: Duplicado (archivo ya enviado)
+        // Caso especial: Duplicado (archivo ya enviado)
         if (response.contains("9288W")) {
             result.isDuplicate = true;
             result.requestCode = "928";
             result.returnCode = "8W";
-            System.out.println("    Request Code : 928");
-            System.out.println("    Return Code  : 8W (DUPLICADO)");
-            System.out.println("    Resultado    : ARCHIVO YA ENVIADO");
             return result;
         }
         
         // Buscar respuesta tipo 998
         int idx = response.indexOf("998");
         if (idx >= 0) {
-            // Extraer componentes de la respuesta
             result.requestCode = "998";
             
             if (idx + 5 <= response.length()) {
@@ -486,26 +514,16 @@ public final class MipFileTransfer {
                 result.returnCode = response.substring(idx + 5, idx + 7);
             }
             
-            System.out.println("    Request Code : " + result.requestCode);
-            System.out.println("    Record Type  : " + result.recordType);
-            System.out.println("    Return Code  : " + result.returnCode);
-            
             // Evaluar Return Code
             if ("00".equals(result.returnCode)) {
                 result.isAccepted = true;
-                System.out.println("    Resultado    : ACEPTADO");
-            } else {
-                System.out.println("    Resultado    : RECHAZADO");
             }
             
             return result;
         }
         
         // Respuesta no reconocida
-        System.out.println("    Request Code : ???");
-        System.out.println("    Resultado    : RESPUESTA NO RECONOCIDA");
         result.returnCode = "??";
-        
         return result;
     }
 
@@ -555,9 +573,7 @@ public final class MipFileTransfer {
 
         if (bytesRead > 0) {
             // Convertir de EBCDIC a ASCII usando Charset
-            String result = new String(buffer, 0, bytesRead, EBCDIC);
-            
-            return result;
+            return new String(buffer, 0, bytesRead, EBCDIC);
         }
 
         return "";
@@ -614,15 +630,6 @@ public final class MipFileTransfer {
         }
     }
 
-    private static byte[] intToBytesBE(int num, int bytes) {
-        byte[] result = new byte[bytes];
-        for (int i = bytes - 1; i >= 0; i--) {
-            result[i] = (byte) (num & 0xFF);
-            num >>= 8;
-        }
-        return result;
-    }
-
     private static String processReceivedData(String raw) {
         StringBuilder clean = new StringBuilder();
         String[] lines = raw.split("\n");
@@ -661,7 +668,7 @@ public final class MipFileTransfer {
             "  --ipmname  : Identificador de 9 o 14 caracteres\n" +
             "               9 chars: R27802840 (se agrega Julian+Seq automatico)\n" +
             "               14 chars: R2780284001501 (se usa tal cual, variando Seq)\n" +
-            "  --date     : Fecha en formato YYYYMMDD\n" +
+            "  --date     : Fecha en formato YYYYMMDD\n"
         );
     }
 
