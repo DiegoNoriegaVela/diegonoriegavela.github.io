@@ -567,16 +567,33 @@ public final class MipFileTransfer {
      * Lee datos del socket y convierte de EBCDIC a ASCII.
      */
     private static String inSocket(Socket socket) throws IOException {
-        byte[] buffer = new byte[1024];
+        InputStream in = socket.getInputStream();
 
-        int bytesRead = socket.getInputStream().read(buffer, 0, 1024);
+        // 1. LEER EL ENCABEZADO DE LONGITUD (2 bytes)
+        int b1 = in.read();
+        int b2 = in.read();
 
-        if (bytesRead > 0) {
-            // Convertir de EBCDIC a ASCII usando Charset
-            return new String(buffer, 0, bytesRead, EBCDIC);
+        // Si devuelve -1 es que se cortó la conexión
+        if (b1 < 0 || b2 < 0) {
+            return ""; 
         }
 
-        return "";
+        // Calculamos el tamaño exacto del mensaje que viene (matemática binaria)
+        int len = ((b1 & 0xFF) << 8) | (b2 & 0xFF);
+
+        // 2. LEER EL CONTENIDO EXACTO
+        byte[] buffer = new byte[len];
+        int totalLeido = 0;
+
+        // Bucle para asegurar que leemos todo el mensaje (a veces llega por pedazos)
+        while (totalLeido < len) {
+            int leido = in.read(buffer, totalLeido, len - totalLeido);
+            if (leido < 0) break; // Fin de stream inesperado
+            totalLeido += leido;
+        }
+
+        // 3. CONVERTIR Y RETORNAR
+        return new String(buffer, EBCDIC);
     }
 
     // ========================================================================
