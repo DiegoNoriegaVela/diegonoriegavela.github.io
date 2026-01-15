@@ -215,9 +215,8 @@ import java.util.List;
                      " hex=" + hexBytes(rec, 0, Math.min(16, rec.length)));
              }
              
-             // Convertir de EBCDIC a ASCII legible
-             String ebcdicText = new String(rec, cs);
-             String asciiText = toAsciiPrintable(ebcdicText);
+             // Convertir de EBCDIC a ASCII (conversión directa sin filtros)
+             String asciiText = new String(rec, cs);
              
              // Escribir linea (un registro por linea)
              writer.write(asciiText);
@@ -453,10 +452,9 @@ import java.util.List;
     
      byte[] result;
      if ("e2a".equals(direction)) {
-         // EBCDIC -> ASCII
+         // EBCDIC -> ASCII (conversión directa)
          String ebcdicText = new String(raw, cs);
-         String asciiText = toAsciiPrintable(ebcdicText);
-         result = asciiText.getBytes("UTF-8");
+         result = ebcdicText.getBytes("UTF-8");
      } else {
          // ASCII -> EBCDIC
          String asciiText = new String(raw, "UTF-8");
@@ -711,6 +709,9 @@ import java.util.List;
     int pos = 0;
     int blockNum = 0;
     
+    // Buscar posición del EOF (0x00000000) para determinar tipo de padding
+    int eofPos = findRdwEof(vbs);
+    
     while (pos < vbs.length) {
     int remaining = vbs.length - pos;
     int take = remaining < DATA_PER_BLOCK ? remaining : DATA_PER_BLOCK;
@@ -718,16 +719,21 @@ import java.util.List;
     ```
      // Escribir datos disponibles
      out.write(vbs, pos, take);
+     int currentEndPos = pos + take;
      pos += take;
      blockNum++;
     
      // Padding hasta completar 1012 bytes
      if (take < DATA_PER_BLOCK) {
+         // Determinar tipo de padding: 0x00 después de EOF, 0x40 antes
+         byte padByte = (eofPos > 0 && currentEndPos >= eofPos) ? (byte)0x00 : PAD_40;
+         
          for (int i = 0; i < (DATA_PER_BLOCK - take); i++) {
-             out.write(PAD_40);
+             out.write(padByte);
          }
          if (DEBUG) {
-             System.out.println("DEBUG: Bloque " + blockNum + " con padding: " + 
+             System.out.println("DEBUG: Bloque " + blockNum + " con padding " + 
+                 String.format("0x%02X", padByte & 0xFF) + ": " + 
                  (DATA_PER_BLOCK - take) + " bytes");
          }
      }
