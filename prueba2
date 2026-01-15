@@ -194,107 +194,131 @@ public final class MipFileTransfer {
     // RECEIVE - Recepcion de archivo desde MIP
     // ========================================================================
     
-    private static void receiveFromMip(Params p) throws Exception {
+private static void receiveFromMip(Params p) throws Exception {
         System.out.println("==============================================");
-        System.out.println("MIP FILE TRANSFER - RECEIVE (FROM MASTERCARD)");
+        System.out.println("RECEPCION (FROM MASTERCARD) - LOGICA CORREGIDA");
         System.out.println("==============================================");
-        System.out.println("Archivo salida : " + p.filePath);
         System.out.println("MIP            : " + p.ip + ":" + p.port);
-        System.out.println("IPM Name       : " + p.ipmName);
-        System.out.println("Fecha          : " + p.date);
-        System.out.println("==============================================");
-
-        // 1. Conectar al MIP
+        
         Socket client = new Socket();
         client.connect(new InetSocketAddress(p.ip, p.port), TIMEOUT);
-        client.setSoTimeout(TIMEOUT);
-        System.out.println("Conexion       : OK\n");
-
-        // 2. Determinar secuencia inicial
-        int seqInicial = 1;
-        if (p.ipmName.length() == 14) {
-            seqInicial = Integer.parseInt(p.ipmName.substring(12, 14));
-        }
-
-        StringBuilder contenido = new StringBuilder();
-        String txIdEncontrado = null;
-        String lastRawResponse = "";
+        client.setSoTimeout(TIMEOUT); // Importante para no quedarse colgado
+        
+        System.out.println("Conexion       : OK");
 
         try {
-            // 3. FASE 1: Buscar archivo con Request 101
-            System.out.println("[FASE 1] Buscando archivo en MIP...");
-            System.out.println("  Buscando secuencia desde " + String.format("%02d", seqInicial) + "...\n");
+            // 1. Calcular secuencia inicial
+            int seqInicial = 1;
+            if (p.ipmName.length() == 14) {
+                seqInicial = Integer.parseInt(p.ipmName.substring(12, 14));
+            }
 
+            String txIdEncontrado = null;
+            StringBuilder bufferDatos = new StringBuilder(); // Aquí guardaremos solo los datos limpios
+
+            // 2. Bucle de búsqueda (FASE 1)
             for (int seq = seqInicial; seq <= MAX_SEQ; seq++) {
                 String seqStr = String.format("%02d", seq);
                 String txId = buildTransmissionId(p.ipmName, p.date, seqStr);
-                String request = buildRequest101(txId);
-
-                System.out.println("  [Seq " + seqStr + "] Solicitando: " + txId);
-
-                // Enviar Request
-                outSocket(client, request.getBytes());
-
-                // Leer respuesta completa
-                contenido = new StringBuilder();
-                boolean moreData = true;
-
-                while (moreData) {
-                    String chunk = inSocket(client);
-                    contenido.append(chunk);
-
-                    if (contenido.indexOf("998") >= 0) {
-                        moreData = false;
-                    }
+                
+                System.out.print("Probando Seq " + seqStr + " (ID: " + txId + ")... ");
+                
+                // A. Enviar Request 101
+                outSocket(client, buildRequest101(txId).getBytes(EBCDIC));
+                
+                // B. Leer la primera respuesta (HEADER)
+                String header = inSocket(client); // Usando el inSocket corregido que lee 2 bytes de longitud
+                
+                if (header.startsWith("998")) {
+                    System.out.println("NO ESTA (MIP respondio 998)");
+                    // Importante: El MIP espera que cerremos y abramos socket para nuevo intento limpio
+                    client.close(); 
+                    client = new Socket();
+                    client.connect(new InetSocketAddress(p.ip, p.port), TIMEOUT);
+                    continue;
                 }
                 
-                lastRawResponse = contenido.toString().trim();
-
-                // Verificar si encontro el archivo
-                if (contenido.indexOf("9980100") >= 0) {
+                if (header.startsWith("004")) {
+                    System.out.println("ENCONTRADO!");
                     txIdEncontrado = txId;
-                    System.out.println("           -> ENCONTRADO\n");
-                    break;
-                } else {
-                    // Mostrar cada intento (uno por uno)
-                    System.out.println("           -> No encontrado");
+                    
+                    // 3. FASE 2: Recibir bloques de datos (Bucle de lectura)
+                    System.out.println("Descargando datos...");
+                    boolean recibiendo = true;
+                    int bloquesRecibidos = 0;
+                    
+                    while (recibiendo) {
+                        String bloque = inSocket(client);
+                        
+                        // Caso 1: Cadena vacía (error de red o fin inesperado)
+                        if (bloque == null || bloque.length() == 0) {
+                            break; 
+                        }
+
+                        // Caso 2: Es el TRAILER (Fin de archivo)
+                        if (bloque.startsWith("998")) {
+                            System.out.println("  -> Fin de archivo (Trailer 998) recibido.");
+                            recibiendo = false; // Salimos del while
+                            break;
+                        }
+
+                        // Caso 3: Es un bloque de DATOS
+                        // El MIP manda una 'T' al inicio. A veces manda basura antes.
+                        // Buscamos la 'T' y guardamos lo que sigue.
+                        String datosLimpios = limpiarBloqueDeDatos(bloque);
+                        
+                        if (datosLimpios.length() > 0) {
+                            bufferDatos.append(datosLimpios);
+                            bufferDatos.append("\n"); // Agregamos salto de línea para que sea legible
+                            bloquesRecibidos++;
+                        }
+                    }
+                    
+                    // Si salimos del while, ya tenemos todo
+                    break; // Romper el bucle FOR de secuencias
                 }
             }
 
             if (txIdEncontrado == null) {
-                System.err.println("\nERROR: Archivo no encontrado en MIP");
-                System.err.println("  Rango intentado: " + String.format("%02d", seqInicial) + " - " + MAX_SEQ);
-                System.err.println("  Ultima respuesta MIP: " + lastRawResponse);
-                throw new IOException("Archivo no encontrado (secuencias " + seqInicial + "-" + MAX_SEQ + " agotadas)");
+                throw new IOException("No se encontró el archivo tras probar todas las secuencias.");
             }
-            
-            System.out.println("  Transmission ID encontrado: " + txIdEncontrado);
 
-            // 4. FASE 2: Procesar y guardar contenido
-            System.out.println("\n[FASE 2] Procesando y guardando archivo...");
-            
-            String data = processReceivedData(contenido.toString());
-            int dataLength = data.length();
-
-            // Escribir con header del nombre
-            StringBuilder output = new StringBuilder();
-            output.append("[").append(txIdEncontrado).append("]\n");
-            output.append(data);
-
-            writeToFile(p.filePath, output.toString());
-            
-            System.out.println("  Datos recibidos: " + dataLength + " caracteres");
-
-            System.out.println("\n==============================================");
-            System.out.println("RECEPCION COMPLETADA EXITOSAMENTE");
-            System.out.println("==============================================");
-            System.out.println("Transmission ID : " + txIdEncontrado);
-            System.out.println("Archivo guardado: " + p.filePath);
-            System.out.println("==============================================");
+            // 4. Guardar archivo final
+            if (bufferDatos.length() > 0) {
+                writeToFile(p.filePath, bufferDatos.toString());
+                System.out.println("\nARCHIVO GUARDADO EXITOSAMENTE: " + p.filePath);
+                System.out.println("Tamaño final: " + bufferDatos.length() + " caracteres.");
+            } else {
+                System.err.println("\nADVERTENCIA: El archivo se encontró pero está vacío (0 datos).");
+            }
 
         } finally {
-            try { client.close(); } catch (Exception ignore) {}
+            if (client != null && !client.isClosed()) client.close();
         }
+    }
+
+    /**
+     * Limpia el indicador de protocolo ('T') del bloque recibido.
+     */
+    private static String limpiarBloqueDeDatos(String bloqueRaw) {
+        // El bloque suele empezar con 'T' (Transmit).
+        // En EBCDIC 'T' es 0xE3, al pasar por inSocket ya es una letra 'T' o un caracter extraño
+        // dependiendo de la conversión.
+        
+        // Estrategia simple: Si empieza con 'T', quitamos la primera letra.
+        if (bloqueRaw.startsWith("T")) {
+            return bloqueRaw.substring(1);
+        }
+        
+        // Estrategia robusta: A veces el 'T' no es el primer caracter si hubo padding.
+        // Buscamos la primera 'T' y tomamos lo que sigue.
+        int indexT = bloqueRaw.indexOf("T");
+        if (indexT >= 0 && indexT < 5) { // Asumimos que la T está en los primeros 5 chars
+            return bloqueRaw.substring(indexT + 1);
+        }
+        
+        // Si no encontramos 'T', devolvemos el bloque entero (mejor que perder datos)
+        return bloqueRaw;
     }
 
     // ========================================================================
