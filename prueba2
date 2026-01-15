@@ -1,122 +1,947 @@
-// ========================================================================
-    // RECEIVE - Recepcion de archivo desde MIP (CORREGIDO)
+import java.io.*;
+import java.net.*;
+import java.nio.charset.Charset;
+import java.util.*;
+
+/**
+ * MipFileTransfer - Sistema de Transferencia de Archivos IPM hacia/desde MIP de Mastercard
+ * 
+ * Basado en el protocolo "File Transfer Manual Version 1.1" y logica del GCO_MIP original.
+ * 
+ * ENVIO (TO MASTERCARD):
+ *   1. Conecta al MIP
+ *   2. Intenta secuencias 01-99 hasta que el Header 004 sea aceptado
+ *   3. Envia bloques de datos (archivo cortado en 980 bytes + 'R')
+ *   4. Envia Trailer 998 con conteo de bloques
+ *   5. Espera confirmacion final
+ * 
+ * RECEPCION (FROM MASTERCARD):
+ *   1. Conecta al MIP
+ *   2. Envia Request 101 con secuencias 01-99 hasta encontrar archivo
+ *   3. Recibe bloques de datos
+ *   4. Convierte de EBCDIC a ASCII y guarda
+ * 
+ * @version 4.1
+ */
+public final class MipFileTransfer {
+
+    // ========================================================================
+    // CONFIGURACION
+    // ========================================================================
+    
+    private static final Charset EBCDIC = Charset.forName("Cp500");
+    private static final Charset ASCII = Charset.forName("ISO-8859-1");
+    
+    private static final int DATA_CHUNK = 980;
+    private static final int TIMEOUT = 60000;
+    private static final int MAX_SEQ = 10;
+
+    // ========================================================================
+    // MAIN
+    // ========================================================================
+
+    public static void main(String[] args) {
+        try {
+            Params p = Params.parse(args);
+            if (p == null) {
+                usage();
+                System.exit(2);
+            }
+
+            if ("send".equalsIgnoreCase(p.mode)) {
+                sendToMip(p);
+            } else if ("receive".equalsIgnoreCase(p.mode)) {
+                receiveFromMip(p);
+            } else {
+                System.err.println("ERROR: Modo invalido. Use 'send' o 'receive'");
+                usage();
+                System.exit(2);
+            }
+        } catch (Exception e) {
+            System.err.println("ERROR: " + e.getMessage());
+            System.exit(1);
+        }
+    }
+
+    // ========================================================================
+    // SEND - Envio de archivo al MIP
+    // ========================================================================
+    
+    private static void sendToMip(Params p) throws Exception {
+        File f = new File(p.filePath);
+        if (!f.exists()) {
+            throw new FileNotFoundException("Archivo no encontrado: " + p.filePath);
+        }
+
+        System.out.println("==============================================");
+        System.out.println("MIP FILE TRANSFER - SEND (TO MASTERCARD)");
+        System.out.println("==============================================");
+        System.out.println("Archivo        : " + f.getName());
+        System.out.println("Tamano         : " + f.length() + " bytes");
+        System.out.println("MIP            : " + p.ip + ":" + p.port);
+        System.out.println("IPM Name       : " + p.ipmName);
+        System.out.println("Fecha          : " + p.date);
+        System.out.println("==============================================");
+
+        // 1. Leer archivo
+        byte[] fileBytes = readAllBytes(f);
+        if (fileBytes.length == 0) {
+            throw new IOException("El archivo esta vacio");
+        }
+
+        // 2. Particionar archivo (sin trailer)
+        List<byte[]> dataBlocks = partFile(fileBytes);
+        System.out.println("Bloques datos  : " + dataBlocks.size());
+
+        // 3. Conectar al MIP
+        Socket client = new Socket();
+        client.connect(new InetSocketAddress(p.ip, p.port), TIMEOUT);
+        client.setSoTimeout(TIMEOUT);
+        System.out.println("Conexion       : OK\n");
+
+        try {
+            // 4. Determinar secuencia inicial
+            int seqInicial = 1;
+            if (p.ipmName.length() == 14) {
+                seqInicial = Integer.parseInt(p.ipmName.substring(12, 14));
+            }
+
+            // 5. FASE 1: Buscar secuencia valida para el Header
+            String txIdAceptado = null;
+            String lastRawResponse = "";
+            
+            System.out.println("[FASE 1] Consultando Header 004...");
+            System.out.println("  Buscando secuencia disponible desde " + String.format("%02d", seqInicial) + "...\n");
+            
+            for (int seq = seqInicial; seq <= MAX_SEQ; seq++) {
+                String seqStr = String.format("%02d", seq);
+                String txId = buildTransmissionId(p.ipmName, p.date, seqStr);
+                String header = buildHeader004(txId);
+                
+                System.out.println("  [Seq " + seqStr + "] Solicitando: " + txId);
+                
+                // Enviar Header
+                outSocket(client, header.getBytes());
+                
+                // Leer respuesta
+                String resp = inSocket(client).trim();
+                lastRawResponse = resp;
+                
+                // Analizar respuesta
+                McResponse mcResp = checkMcResponse(resp);
+                
+                if (mcResp.isAccepted) {
+                    txIdAceptado = txId;
+                    System.out.println("           -> ACEPTADO\n");
+                    break;
+                } else if (mcResp.isDuplicate) {
+                    System.out.println("           -> DUPLICADO (ya enviado), probando siguiente...");
+                } else {
+                    System.out.println("           -> RECHAZADO (RC=" + mcResp.returnCode + "), probando siguiente...");
+                }
+            }
+            
+            if (txIdAceptado == null) {
+                System.err.println("\nERROR: No se encontro secuencia disponible");
+                System.err.println("  Rango intentado: " + String.format("%02d", seqInicial) + " - " + MAX_SEQ);
+                System.err.println("  Ultima respuesta MIP: " + lastRawResponse);
+                throw new IOException("Secuencias agotadas (" + seqInicial + "-" + MAX_SEQ + ")");
+            }
+            
+            System.out.println("  Transmission ID aceptado: " + txIdAceptado);
+
+            // 6. FASE 2: Enviar bloques de datos
+            System.out.println("\n[FASE 2] Enviando bloques de datos...");
+            
+            for (int i = 0; i < dataBlocks.size(); i++) {
+                outSocket(client, dataBlocks.get(i));
+                
+                if ((i + 1) % 50 == 0 || i == dataBlocks.size() - 1) {
+                    System.out.println("  Enviados: " + (i + 1) + "/" + dataBlocks.size());
+                }
+            }
+
+            // 7. FASE 3: Enviar Trailer 998
+            System.out.println("\n[FASE 3] Enviando Trailer 998...");
+            System.out.println("  Block count: " + (dataBlocks.size() + 1) + " (datos + trailer)");
+            
+            outSocket(client, buildTrailer998(dataBlocks.size()));
+            
+            // 8. Esperar confirmacion final
+            String respFinal = inSocket(client).trim();
+            McResponse mcRespFinal = checkMcResponse(respFinal);
+            
+            System.out.println("  Respuesta MIP: " + respFinal);
+            
+            if (mcRespFinal.isAccepted) {
+                System.out.println("\n==============================================");
+                System.out.println("ENVIO COMPLETADO EXITOSAMENTE");
+                System.out.println("==============================================");
+                System.out.println("Transmission ID : " + txIdAceptado);
+                System.out.println("Bloques enviados: " + (dataBlocks.size() + 1));
+                System.out.println("==============================================");
+            } else {
+                System.err.println("  -> RECHAZADO");
+                throw new IOException("Trailer rechazado por MIP: " + respFinal);
+            }
+
+        } finally {
+            try { client.close(); } catch (Exception ignore) {}
+        }
+    }
+
+    // ========================================================================
+    // RECEIVE - Recepcion de archivo desde MIP
     // ========================================================================
     
     private static void receiveFromMip(Params p) throws Exception {
         System.out.println("==============================================");
-        System.out.println("MIP FILE TRANSFER - RECEIVE (AS ASCII)");
+        System.out.println("MIP FILE TRANSFER - RECEIVE (FROM MASTERCARD)");
         System.out.println("==============================================");
+        System.out.println("Archivo salida : " + p.filePath);
         System.out.println("MIP            : " + p.ip + ":" + p.port);
-        System.out.println("Archivo Salida : " + p.filePath);
+        System.out.println("IPM Name       : " + p.ipmName);
+        System.out.println("Fecha          : " + p.date);
+        System.out.println("==============================================");
 
-        Socket client = null;
-        boolean archivoEncontrado = false;
-        
-        // 1. Determinar secuencia inicial
+        // 1. Conectar al MIP
+        Socket client = new Socket();
+        client.connect(new InetSocketAddress(p.ip, p.port), TIMEOUT);
+        client.setSoTimeout(TIMEOUT);
+        System.out.println("Conexion       : OK\n");
+
+        // 2. Determinar secuencia inicial
         int seqInicial = 1;
         if (p.ipmName.length() == 14) {
             seqInicial = Integer.parseInt(p.ipmName.substring(12, 14));
         }
 
-        // 2. BUCLE DE BÚSQUEDA DE SECUENCIA
-        for (int seq = seqInicial; seq <= MAX_SEQ; seq++) {
-            
-            String seqStr = String.format("%02d", seq);
-            String txId = buildTransmissionId(p.ipmName, p.date, seqStr);
-            
-            System.out.print("Probando Seq " + seqStr + " (ID: " + txId + ")... ");
+        StringBuilder contenido = new StringBuilder();
+        String txIdEncontrado = null;
+        String lastRawResponse = "";
 
-            try {
-                client = new Socket();
-                client.connect(new InetSocketAddress(p.ip, p.port), TIMEOUT);
-                client.setSoTimeout(TIMEOUT);
+        try {
+            // 3. FASE 1: Buscar archivo con Request 101
+            System.out.println("[FASE 1] Buscando archivo en MIP...");
+            System.out.println("  Buscando secuencia desde " + String.format("%02d", seqInicial) + "...\n");
 
-                // A. Enviar Request 101
-                outSocket(client, buildRequest101(txId).getBytes(EBCDIC));
+            for (int seq = seqInicial; seq <= MAX_SEQ; seq++) {
+                String seqStr = String.format("%02d", seq);
+                String txId = buildTransmissionId(p.ipmName, p.date, seqStr);
+                String request = buildRequest101(txId);
 
-                // B. Leer la primera respuesta (Header)
-                String respuesta = inSocket(client);
+                System.out.println("  [Seq " + seqStr + "] Solicitando: " + txId);
 
-                // Si responde con 998 (pero no es 004), es un rechazo/no encontrado
-                if (respuesta.contains("998") && !respuesta.contains("004")) {
-                    System.out.println("No encontrado.");
-                    client.close();
-                    continue; // Probar siguiente secuencia
-                }
+                // Enviar Request
+                outSocket(client, request.getBytes());
 
-                // C. Si contiene 004, ¡ENCONTRADO!
-                if (respuesta.contains("004")) {
-                    System.out.println("ENCONTRADO!");
-                    archivoEncontrado = true;
+                // Leer respuesta completa
+                contenido = new StringBuilder();
+                boolean moreData = true;
+
+                while (moreData) {
+                    String chunk = inSocket(client);
                     
-                    // 3. FASE DE DESCARGA (Procesamiento directo)
-                    // Usamos BufferedWriter para escribir texto limpio
-                    BufferedWriter writer = new BufferedWriter(new FileWriter(p.filePath));
-                    int caracteresGuardados = 0;
-                    
-                    try {
-                        System.out.println("Descargando datos...");
-                        
-                        while (true) {
-                            // Leer siguiente paquete
-                            String paquete = inSocket(client);
-                            
-                            // Si retorna vacio, se corto la conexion o acabo
-                            if (paquete == null || paquete.isEmpty()) break; 
-
-                            // --- CHEQUEO DE FIN DE ARCHIVO ---
-                            // Si el paquete contiene el Trailer 998, terminamos
-                            if (paquete.contains("998")) {
-                                System.out.println("  -> Fin de archivo recibido (Trailer 998).");
-                                break;
-                            }
-
-                            // --- PROCESAMIENTO DE DATOS ---
-                            // El MIP pone una 'T' al inicio de cada bloque de datos.
-                            // Debemos quitarla para tener el texto limpio.
-                            
-                            String lineaLimpia = paquete;
-                            
-                            // Buscamos la 'T' (Indicador de Transmisión)
-                            // Al convertir de EBCDIC a String, 0xE3 se convierte en 'T'
-                            int indiceT = paquete.indexOf("T"); 
-                            
-                            if (indiceT >= 0) {
-                                // Guardamos todo lo que está DESPUÉS de la T
-                                lineaLimpia = paquete.substring(indiceT + 1);
-                            } else {
-                                // Si no hay T, asumimos que el primer caracter es control y lo saltamos
-                                if (lineaLimpia.length() > 0) {
-                                    lineaLimpia = lineaLimpia.substring(1);
-                                }
-                            }
-                            
-                            // Escribir al archivo si hay datos
-                            if (lineaLimpia.length() > 0) {
-                                writer.write(lineaLimpia);
-                                writer.newLine(); // Agregamos salto de linea para legibilidad
-                                caracteresGuardados += lineaLimpia.length();
-                            }
-                        }
-                    } finally {
-                        writer.close();
+                    if (chunk == null || chunk.isEmpty()) {
+                        moreData = false;
+                        break;
                     }
                     
-                    System.out.println("Datos guardados: " + caracteresGuardados + " caracteres.");
-                    break; // Salimos del bucle FOR
+                    // IMPORTANTE: Agregamos \n para separar los bloques visualmente
+                    // Esto permite que processReceivedData pueda analizar línea por línea después.
+                    contenido.append(chunk).append("\n");
+
+                    if (chunk.contains("998")) {
+                        moreData = false;
+                    }
+                }
+                
+                lastRawResponse = contenido.toString().trim();
+
+                // Verificar si encontro el archivo
+                if (contenido.indexOf("9980100") >= 0) {
+                    txIdEncontrado = txId;
+                    System.out.println("           -> ENCONTRADO\n");
+                    break;
+                } else {
+                    // Mostrar cada intento (uno por uno)
+                    System.out.println("           -> No encontrado");
+                }
+            }
+
+            if (txIdEncontrado == null) {
+                System.err.println("\nERROR: Archivo no encontrado en MIP");
+                System.err.println("  Rango intentado: " + String.format("%02d", seqInicial) + " - " + MAX_SEQ);
+                System.err.println("  Ultima respuesta MIP: " + lastRawResponse);
+                throw new IOException("Archivo no encontrado (secuencias " + seqInicial + "-" + MAX_SEQ + " agotadas)");
+            }
+            
+            System.out.println("  Transmission ID encontrado: " + txIdEncontrado);
+
+            // 4. FASE 2: Procesar y guardar contenido
+            System.out.println("\n[FASE 2] Procesando y guardando archivo...");
+            
+            // Llamamos a tu función solicitada
+            String data = processReceivedData(contenido.toString());
+            
+            // Escribir archivo final
+            writeToFile(p.filePath, data);
+            
+            System.out.println("  Datos recibidos: " + dataLength + " caracteres");
+
+            System.out.println("\n==============================================");
+            System.out.println("RECEPCION COMPLETADA EXITOSAMENTE");
+            System.out.println("==============================================");
+            System.out.println("Transmission ID : " + txIdEncontrado);
+            System.out.println("Archivo guardado: " + p.filePath);
+            System.out.println("==============================================");
+
+        } finally {
+            try { client.close(); } catch (Exception ignore) {}
+        }
+    }
+
+    private static void receiveFromMip(Params p) throws Exception {
+        System.out.println("==============================================");
+        System.out.println("MIP FILE TRANSFER - RECEIVE (ASCII MODE)");
+        System.out.println("==============================================");
+        System.out.println("Archivo salida : " + p.filePath);
+        System.out.println("MIP            : " + p.ip + ":" + p.port);
+        System.out.println("IPM Name       : " + p.ipmName);
+        System.out.println("Fecha          : " + p.date);
+        System.out.println("==============================================");
+
+        // 1. Conectar al MIP
+        Socket client = new Socket();
+        client.connect(new InetSocketAddress(p.ip, p.port), TIMEOUT);
+        client.setSoTimeout(TIMEOUT);
+        System.out.println("Conexion       : OK\n");
+
+        // 2. Determinar secuencia inicial
+        int seqInicial = 1;
+        if (p.ipmName.length() == 14) {
+            seqInicial = Integer.parseInt(p.ipmName.substring(12, 14));
+        }
+
+        StringBuilder datosLimpios = new StringBuilder(); // Aquí guardaremos SOLO la información útil
+        String txIdEncontrado = null;
+        String lastRawResponse = "";
+        boolean encontrado = false;
+
+        try {
+            // 3. FASE 1: Buscar archivo
+            System.out.println("[FASE 1] Buscando archivo en MIP...");
+            
+            for (int seq = seqInicial; seq <= MAX_SEQ; seq++) {
+                String seqStr = String.format("%02d", seq);
+                String txId = buildTransmissionId(p.ipmName, p.date, seqStr);
+                String request = buildRequest101(txId);
+
+                System.out.print("  [Seq " + seqStr + "] Solicitando: " + txId + " ... ");
+
+                // Enviar Request
+                outSocket(client, request.getBytes());
+
+                // Leer PRIMER fragmento (Header o Error)
+                String firstChunk = inSocket(client);
+                
+                // Si el primer fragmento contiene 998 (y no 004), es error/no encontrado
+                if (firstChunk.contains("998") && !firstChunk.contains("004")) {
+                    System.out.println("No encontrado.");
+                    // Reiniciamos conexión para el siguiente intento (MIP prefiere sesiones limpias)
+                    client.close();
+                    client = new Socket();
+                    client.connect(new InetSocketAddress(p.ip, p.port), TIMEOUT);
+                    client.setSoTimeout(TIMEOUT);
+                    continue; 
                 }
 
-            } catch (Exception e) {
-                System.out.println("Error conexión: " + e.getMessage());
-            } finally {
-                if (client != null && !client.isClosed()) client.close();
+                if (firstChunk.contains("004")) {
+                    System.out.println("ENCONTRADO!");
+                    txIdEncontrado = txId;
+                    encontrado = true;
+                    
+                    // --- FASE 2: RECEPCIÓN Y PROCESAMIENTO INTELIGENTE ---
+                    System.out.println("\n[FASE 2] Recibiendo y procesando datos (Estilo RDW)...");
+                    
+                    // Procesamos el primer chunk (que ya leímos) por si traía datos pegados al header
+                    procesarChunk(firstChunk, datosLimpios);
+                    
+                    // Bucle principal de lectura
+                    while (true) {
+                        String chunk = inSocket(client);
+                        
+                        // Si chunk es null o vacío, se acabó la transmisión o conexión
+                        if (chunk == null || chunk.length() == 0) break;
+
+                        // Si contiene el Trailer 998, terminamos
+                        if (chunk.contains("998")) {
+                            System.out.println("  -> Fin de archivo (Trailer 998) detectado.");
+                            break;
+                        }
+
+                        // PROCESAMIENTO TIPO RDW (Adaptado a String ASCII)
+                        // El código original busca la 'T' (0xE3) en pos 0, 1 (padding) o 4 (RDW).
+                        // Al convertir a String, los bytes basura se vuelven caracteres raros, 
+                        // pero la 'T' se mantiene como 'T'.
+                        
+                        procesarChunk(chunk, datosLimpios);
+                    }
+                    
+                    // Ya tenemos todo, salimos del bucle de secuencias
+                    break;
+                }
+            }
+
+            if (!encontrado) {
+                System.err.println("\nERROR: Archivo no encontrado en el rango de secuencias.");
+                throw new IOException("Archivo no encontrado.");
+            }
+            
+            // 4. GUARDAR ARCHIVO
+            // Ahora 'datosLimpios' tiene solo el contenido útil, sin RDWs ni 'T's ni '998'.
+            System.out.println("\n[FASE 3] Guardando archivo en disco...");
+            
+            StringBuilder output = new StringBuilder();
+            output.append("[").append(txIdEncontrado).append("]\n");
+            output.append(datosLimpios);
+
+            writeToFile(p.filePath, output.toString());
+            
+            System.out.println("  Datos recibidos : " + datosLimpios.length() + " caracteres");
+            System.out.println("  Archivo guardado: " + p.filePath);
+            System.out.println("\nRECEPCION COMPLETADA EXITOSAMENTE");
+
+        } finally {
+            try { client.close(); } catch (Exception ignore) {}
+        }
+    }
+
+    /**
+     * Lógica auxiliar para limpiar la basura (RDW/Padding) y extraer los datos.
+     * Imita la lógica del código original: busca la 'T' en posiciones específicas.
+     */
+    private static void procesarChunk(String chunk, StringBuilder buffer) {
+        // En el código original, el indicador 'T' (0xE3) marca el inicio de los datos reales.
+        // Puede haber 4 bytes de basura antes (RDW), 1 byte (padding), o ninguno.
+        
+        int dataStart = -1;
+        int indexT = chunk.indexOf('T'); // Buscamos la primera 'T'
+
+        // Aplicamos la heurística del original:
+        if (indexT == 0) {
+            dataStart = 0; // Caso ideal: 'T' al inicio
+        } else if (indexT == 4) {
+            dataStart = 4; // Caso RDW: 4 bytes de basura antes de la 'T'
+        } else if (indexT == 1) {
+            dataStart = 1; // Caso Padding: 1 byte de basura antes
+        }
+        
+        // Si encontramos una estructura válida
+        if (dataStart != -1) {
+            // Extraemos todo lo que está DESPUÉS de la 'T'
+            if (chunk.length() > dataStart + 1) {
+                String payload = chunk.substring(dataStart + 1);
+                buffer.append(payload);
+                buffer.append("\n"); // Agregamos salto de línea para mantener formato legible
+            }
+        } else {
+            // Si no encontramos 'T' en lugares conocidos, pero el chunk tiene contenido y no es header/trailer
+            // (A veces pasa con fragmentación de red), guardamos todo por seguridad.
+            if (!chunk.contains("004") && chunk.length() > 0) {
+                 buffer.append(chunk);
+            }
+        }
+    }
+
+    // ========================================================================
+    // CONSTRUCCION DE MENSAJES
+    // ========================================================================
+    
+    /**
+     * Construye el Transmission ID de 14 caracteres.
+     * 
+     * Formato segun pagina 32 del Manual:
+     *   RtttEEEEEJJJSS (para envio TO Mastercard)
+     *   TtttEEEEEJJJSS (para recepcion FROM Mastercard)
+     * 
+     * Donde:
+     *   R/T   : Direction indicator (1 char)
+     *   ttt   : Transmission Type (3 digitos)
+     *   EEEEE : Endpoint Number (5 digitos)
+     *   JJJ   : Julian Day del ano (001-366)
+     *   SS    : Sequence Number (01-99)
+     * 
+     * @param ipmName Nombre base (9 chars) o completo (14 chars)
+     * @param date Fecha YYYYMMDD para calcular dia Juliano
+     * @param sequence Secuencia "01"-"99"
+     * @return Transmission ID de 14 caracteres
+     */
+    private static String buildTransmissionId(String ipmName, String date, String sequence) {
+        if (ipmName == null || ipmName.isEmpty()) {
+            throw new IllegalArgumentException("ipmName no puede ser vacio");
+        }
+        
+        ipmName = ipmName.trim().toUpperCase();
+        
+        // Si ya tiene 14 caracteres, reemplazar solo la secuencia
+        if (ipmName.length() == 14) {
+            return ipmName.substring(0, 12) + sequence;
+        }
+        
+        // Si tiene 9 caracteres, agregar Julian + Sequence
+        if (ipmName.length() == 9) {
+            int year = Integer.parseInt(date.substring(0, 4));
+            int month = Integer.parseInt(date.substring(4, 6));
+            int day = Integer.parseInt(date.substring(6, 8));
+            
+            int julianDay = toJulian(year, month, day) - toJulian(year - 1, 12, 31);
+            String julianStr = String.format("%03d", julianDay);
+            
+            return ipmName + julianStr + sequence;
+        }
+        
+        throw new IllegalArgumentException("ipmName debe tener 9 o 14 caracteres. Actual: " + ipmName.length());
+    }
+    
+    /**
+     * Construye Header 004 "To Mastercard" - Pagina 49 del Manual
+     * 
+     * Estructura (19 bytes minimo, hasta 60 bytes con opcionales):
+     *   pos 1-3  : Request Code "004" (3 bytes)
+     *   pos 4-5  : Record Type "01" (2 bytes)
+     *   pos 6-19 : Transmission ID (14 bytes) - RtttEEEEEJJJSS
+     *   --- Campos opcionales (no enviados en esta implementacion) ---
+     *   pos 20-36: Filler (17 bytes)
+     *   pos 37-40: Reserved - File Size (4 bytes)
+     *   pos 41-44: Reserved - Sequence Number (4 bytes)
+     *   pos 45-60: Filler (16 bytes)
+     * 
+     * @param txId Transmission ID de 14 caracteres
+     * @return Header como String (19 caracteres)
+     */
+    private static String buildHeader004(String txId) {
+        if (txId == null || txId.length() != 14) {
+            throw new IllegalArgumentException("Transmission ID debe tener 14 caracteres");
+        }
+        // "004" = Request Code (solicitud de envio)
+        // "01"  = Record Type (tipo de registro estandar)
+        return "004" + "01" + txId;
+    }
+    
+    /**
+     * Construye Request 101 "From Mastercard" - Pagina 51 del Manual
+     * 
+     * Estructura (19 bytes):
+     *   pos 1-3  : Request Code "101" (3 bytes)
+     *   pos 4-5  : Record Type "01" (2 bytes)
+     *   pos 6-19 : Transmission ID (14 bytes) - TtttEEEEEJJJSS
+     * 
+     * @param txId Transmission ID de 14 caracteres
+     * @return Request como String (19 caracteres)
+     */
+    private static String buildRequest101(String txId) {
+        if (txId == null || txId.length() != 14) {
+            throw new IllegalArgumentException("Transmission ID debe tener 14 caracteres");
+        }
+        // "101" = Request Code (solicitud de recepcion)
+        // "01"  = Record Type (tipo de registro estandar)
+        return "101" + "01" + txId;
+    }
+
+    /**
+     * Construye Trailer 998 - Pagina 50 del Manual
+     * 
+     * Estructura (11 bytes total):
+     *   pos 1-3  : Request Code "998" (3 bytes) - Indica fin de transmision
+     *   pos 4-5  : Record Type "01" (2 bytes)
+     *   pos 6-7  : Return Code "00" (2 bytes) - "00" = OK
+     *   pos 8-11 : Number of Blocks (4 bytes Big-Endian)
+     * 
+     * Nota: El block count (pos 8-11) se envia como binario puro,
+     * NO se convierte a EBCDIC.
+     * 
+     * @param dataBlockCount Cantidad de bloques de datos enviados
+     * @return Trailer como byte[] (11 bytes)
+     */
+    private static byte[] buildTrailer998(int dataBlockCount) {
+        byte[] trailer = new byte[11];
+        
+        // pos 1-7: "9980100" en ASCII
+        byte[] prefix = "9980100".getBytes();
+        System.arraycopy(prefix, 0, trailer, 0, 7);
+        
+        // pos 8-11: Block count (Big-Endian, incluye el trailer)
+        int totalCount = dataBlockCount + 1;
+        trailer[7] = (byte) ((totalCount >> 24) & 0xFF);
+        trailer[8] = (byte) ((totalCount >> 16) & 0xFF);
+        trailer[9] = (byte) ((totalCount >> 8) & 0xFF);
+        trailer[10] = (byte) (totalCount & 0xFF);
+        
+        return trailer;
+    }
+
+    // ========================================================================
+    // PARTICIONADO DE ARCHIVO
+    // ========================================================================
+    
+    /**
+     * Corta el archivo en bloques de 980 bytes y agrega 'R' al inicio de cada uno.
+     * NO incluye el trailer (se envia por separado).
+     * 
+     * @param file Bytes del archivo a particionar
+     * @return Lista de bloques de datos
+     */
+    private static List<byte[]> partFile(byte[] file) {
+        List<byte[]> blocks = new ArrayList<byte[]>();
+
+        int parts = (int) Math.ceil((double) file.length / DATA_CHUNK);
+        if (parts == 0) parts = 1;
+
+        for (int i = 0; i < parts; i++) {
+            int start = i * DATA_CHUNK;
+            int end = Math.min(start + DATA_CHUNK, file.length);
+            int size = end - start;
+
+            // Bloque = 'R' + datos
+            byte[] block = new byte[size + 1];
+            block[0] = (byte) 'R';  // Direction Indicator (ASCII)
+            System.arraycopy(file, start, block, 1, size);
+            
+            blocks.add(block);
+        }
+
+        return blocks;
+    }
+
+    // ========================================================================
+    // VALIDACION DE RESPUESTAS DEL MIP
+    // ========================================================================
+    
+    /**
+     * Clase para encapsular la respuesta del MIP
+     */
+    private static class McResponse {
+        boolean isAccepted = false;
+        boolean isDuplicate = false;
+        String requestCode = "";   // "998", "004", etc.
+        String recordType = "";    // "01", "6A", etc.
+        String returnCode = "";    // "00" = OK, otros = error
+        String rawResponse = "";
+    }
+
+    /**
+     * Analiza la respuesta del MIP y determina si fue aceptada o rechazada.
+     * 
+     * Estructura de respuesta MIP (segun Manual paginas 50-51):
+     *   pos 1-3: Request Code ("998" para ACK/NACK)
+     *   pos 4-5: Record Type ("01" estandar, "6A" variante, etc.)
+     *   pos 6-7: Return Code ("00" = OK, otros = error)
+     * 
+     * Codigos conocidos:
+     *   9980100 : Aceptado (Request=998, Type=01, RC=00)
+     *   9980101 : Error generico
+     *   9288W   : Archivo duplicado (ya enviado anteriormente)
+     * 
+     * @param response Respuesta recibida del MIP (ya convertida a ASCII)
+     * @return McResponse con el resultado del analisis
+     */
+    private static McResponse checkMcResponse(String response) {
+        McResponse result = new McResponse();
+        result.rawResponse = response;
+        
+        // Caso especial: Duplicado (archivo ya enviado)
+        if (response.contains("9288W")) {
+            result.isDuplicate = true;
+            result.requestCode = "928";
+            result.returnCode = "8W";
+            return result;
+        }
+        
+        // Buscar respuesta tipo 998
+        int idx = response.indexOf("998");
+        if (idx >= 0) {
+            result.requestCode = "998";
+            
+            if (idx + 5 <= response.length()) {
+                result.recordType = response.substring(idx + 3, idx + 5);
+            }
+            
+            if (idx + 7 <= response.length()) {
+                result.returnCode = response.substring(idx + 5, idx + 7);
+            }
+            
+            // Evaluar Return Code
+            if ("00".equals(result.returnCode)) {
+                result.isAccepted = true;
+            }
+            
+            return result;
+        }
+        
+        // Respuesta no reconocida
+        result.returnCode = "??";
+        return result;
+    }
+
+    // ========================================================================
+    // COMUNICACION SOCKET
+    // ========================================================================
+    
+    /**
+     * Envia datos al socket con framing de 2 bytes y conversion a EBCDIC.
+     */
+    private static void outSocket(Socket socket, byte[] data) throws IOException {
+        int len = data.length;
+        
+        // Convertir de ASCII a EBCDIC usando Charset
+        String asciiStr = new String(data, ASCII);
+        byte[] ebcdicData = asciiStr.getBytes(EBCDIC);
+        
+        // Buffer: 2 bytes longitud + datos EBCDIC
+        byte[] buffer = new byte[len + 2];
+        
+        // 2 bytes de longitud (Big-Endian)
+        buffer[0] = (byte) ((len >> 8) & 0xFF);
+        buffer[1] = (byte) (len & 0xFF);
+        
+        // Copiar datos convertidos a EBCDIC
+        System.arraycopy(ebcdicData, 0, buffer, 2, len);
+
+        // Caso especial: Trailer 998 (11 bytes) - el count NO se convierte
+        if (len == 11 && data[0] == '9' && data[1] == '9' && data[2] == '8') {
+            buffer[9] = data[7];
+            buffer[10] = data[8];
+            buffer[11] = data[9];
+            buffer[12] = data[10];
+        }
+
+        socket.getOutputStream().write(buffer, 0, len + 2);
+        socket.getOutputStream().flush();
+    }
+
+    /**
+     * Lee datos del socket y convierte de EBCDIC a ASCII.
+     */
+    private static String inSocket(Socket socket) throws IOException {
+        InputStream in = socket.getInputStream();
+
+        // 1. LEER EL ENCABEZADO DE LONGITUD (2 bytes)
+        int b1 = in.read();
+        int b2 = in.read();
+
+        // Si devuelve -1 es que se cortó la conexión
+        if (b1 < 0 || b2 < 0) {
+            return ""; 
+        }
+
+        // Calculamos el tamaño exacto del mensaje que viene (matemática binaria)
+        int len = ((b1 & 0xFF) << 8) | (b2 & 0xFF);
+
+        // 2. LEER EL CONTENIDO EXACTO
+        byte[] buffer = new byte[len];
+        int totalLeido = 0;
+
+        // Bucle para asegurar que leemos todo el mensaje (a veces llega por pedazos)
+        while (totalLeido < len) {
+            int leido = in.read(buffer, totalLeido, len - totalLeido);
+            if (leido < 0) break; // Fin de stream inesperado
+            totalLeido += leido;
+        }
+
+        // 3. CONVERTIR Y RETORNAR
+        return new String(buffer, EBCDIC);
+    }
+
+    // ========================================================================
+    // UTILIDADES
+    // ========================================================================
+    
+    private static int toJulian(int year, int month, int day) {
+        int i = year;
+        if (year < 0) i++;
+
+        int j = month;
+        if (month > 2) {
+            j++;
+        } else {
+            i--;
+            j += 13;
+        }
+
+        int k = (int) (Math.floor(365.25D * i) + Math.floor(30.6001D * j) + day + 1720995.0D);
+        int m = 588829;
+
+        if (day + 31 * (month + 12 * year) >= m) {
+            int n = (int) (0.01D * i);
+            k += 2 - n + (int) (0.25D * n);
+        }
+
+        return k;
+    }
+
+    private static byte[] readAllBytes(File f) throws IOException {
+        ByteArrayOutputStream out = new ByteArrayOutputStream((int) f.length());
+        FileInputStream in = new FileInputStream(f);
+        try {
+            byte[] buf = new byte[8192];
+            int n;
+            while ((n = in.read(buf)) >= 0) {
+                out.write(buf, 0, n);
+            }
+        } finally {
+            in.close();
+        }
+        return out.toByteArray();
+    }
+
+    private static void writeToFile(String path, String content) throws IOException {
+        FileWriter writer = new FileWriter(path);
+        try {
+            writer.write(content);
+        } finally {
+            writer.close();
+        }
+    }
+
+    /**
+     * Procesa el contenido bruto recibido, eliminando headers, trailers y basura (RDW).
+     * Aplica la lógica de detección de posición 'T' (0, 1, 4).
+     */
+    private static String processReceivedData(String raw) {
+        StringBuilder clean = new StringBuilder();
+        
+        // 1. Separamos por saltos de línea (que agregamos en el bucle de recepción)
+        String[] bloques = raw.split("\n");
+
+        for (String bloque : bloques) {
+            // Ignorar líneas vacías o muy cortas
+            if (bloque == null || bloque.length() == 0) continue;
+
+            // 2. Filtrar mensajes de protocolo (Headers y Trailers)
+            if (bloque.contains("00401") || bloque.startsWith("004")) continue; // Header
+            if (bloque.contains("998") || bloque.startsWith("998")) continue;   // Trailer
+
+            // 3. LOGICA DE LIMPIEZA INTELIGENTE (Estilo GCO/Original)
+            // Buscamos dónde está la 'T' (byte 0xE3 convertido a ASCII)
+            // Puede estar en pos 0, pos 1 (padding) o pos 4 (RDW de 4 bytes)
+            
+            int dataStart = -1;
+            int indexT = bloque.indexOf('T');
+
+            if (indexT == 0) {
+                dataStart = 0; // Caso ideal: T al inicio
+            } else if (indexT == 4) {
+                dataStart = 4; // Caso RDW: 4 bytes basura + T
+            } else if (indexT == 1) {
+                dataStart = 1; // Caso Padding: 1 byte basura + T
+            }
+
+            // 4. Extraer datos
+            if (dataStart != -1) {
+                // Si encontramos la T en una posición válida, guardamos lo que sigue
+                if (bloque.length() > dataStart + 1) {
+                    clean.append(bloque.substring(dataStart + 1));
+                    clean.append("\n"); // Mantenemos el formato de archivo de texto
+                }
+            } else {
+                // FALLBACK: Si no encontramos T pero la línea tiene datos, la guardamos tal cual
+                // (A veces el MIP manda líneas de texto puro sin framing en ciertos reportes)
+                clean.append(bloque);
+                clean.append("\n");
             }
         }
 
-        if (!archivoEncontrado) {
-            System.err.println("\nERROR: No se encontró el archivo en ninguna secuencia.");
-        } else {
-            System.out.println("\nPROCESO COMPLETADO EXITOSAMENTE.");
-            System.out.println("Archivo: " + p.filePath);
+        return clean.toString();
+    }
+
+    // ========================================================================
+    // PARSEO DE ARGUMENTOS
+    // ========================================================================
+    
+    private static void usage() {
+        System.out.println(
+            "MipFileTransfer - Transferencia de archivos MIP Mastercard\n" +
+            "\n" +
+            "Uso:\n" +
+            "  ENVIO:\n" +
+            "    java MipFileTransfer --mode send --ip <host> --port <puerto> \\\n" +
+            "         --file <archivo> --ipmname <R278xxxxx> --date <YYYYMMDD>\n" +
+            "\n" +
+            "  RECEPCION:\n" +
+            "    java MipFileTransfer --mode receive --ip <host> --port <puerto> \\\n" +
+            "         --file <archivo_salida> --ipmname <T279xxxxx> --date <YYYYMMDD>\n" +
+            "\n" +
+            "Parametros:\n" +
+            "  --mode     : 'send' o 'receive'\n" +
+            "  --ip       : Direccion IP del MIP\n" +
+            "  --port     : Puerto del MIP\n" +
+            "  --file     : Archivo de entrada (send) o salida (receive)\n" +
+            "  --ipmname  : Identificador de 9 o 14 caracteres\n" +
+            "               9 chars: R27802840 (se agrega Julian+Seq automatico)\n" +
+            "               14 chars: R2780284001501 (se usa tal cual, variando Seq)\n" +
+            "  --date     : Fecha en formato YYYYMMDD\n"
+        );
+    }
+
+    private static final class Params {
+        String mode;
+        String ip;
+        int port;
+        String filePath;
+        String ipmName;
+        String date;
+
+        static Params parse(String[] args) {
+            Params p = new Params();
+
+            for (int i = 0; i < args.length; i++) {
+                String s = args[i];
+
+                if (s.startsWith("--mode=")) {
+                    p.mode = s.substring(7);
+                } else if (s.equals("--mode") && i + 1 < args.length) {
+                    p.mode = args[++i];
+                } else if (s.startsWith("--ip=")) {
+                    p.ip = s.substring(5);
+                } else if (s.equals("--ip") && i + 1 < args.length) {
+                    p.ip = args[++i];
+                } else if (s.startsWith("--port=")) {
+                    p.port = Integer.parseInt(s.substring(7));
+                } else if (s.equals("--port") && i + 1 < args.length) {
+                    p.port = Integer.parseInt(args[++i]);
+                } else if (s.startsWith("--file=")) {
+                    p.filePath = s.substring(7);
+                } else if (s.equals("--file") && i + 1 < args.length) {
+                    p.filePath = args[++i];
+                } else if (s.startsWith("--ipmname=")) {
+                    p.ipmName = s.substring(10);
+                } else if (s.equals("--ipmname") && i + 1 < args.length) {
+                    p.ipmName = args[++i];
+                } else if (s.startsWith("--date=")) {
+                    p.date = s.substring(7);
+                } else if (s.equals("--date") && i + 1 < args.length) {
+                    p.date = args[++i];
+                }
+            }
+
+            // Validaciones
+            if (p.mode == null || p.ip == null || p.port == 0 ||
+                p.filePath == null || p.ipmName == null || p.date == null) {
+                return null;
+            }
+
+            if (!p.date.matches("\\d{8}")) {
+                System.err.println("ERROR: Formato de fecha invalido. Use YYYYMMDD");
+                return null;
+            }
+            
+            if (p.ipmName.length() != 9 && p.ipmName.length() != 14) {
+                System.err.println("ERROR: ipmname debe tener 9 o 14 caracteres");
+                return null;
+            }
+
+            return p;
         }
     }
+}
