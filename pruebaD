@@ -1,9 +1,9 @@
 import java.io.BufferedReader;
 import java.io.BufferedOutputStream;
 import java.io.File;
-import java.io.FileInputStream;
+import java.io.FileInputStream; 
 import java.io.FileOutputStream;
-import java.io.InputStreamReader;
+import java.io.InputStreamReader; 
 import java.io.IOException;
 
 public class IsoBitmapHexToBinaryConverter {
@@ -11,13 +11,12 @@ public class IsoBitmapHexToBinaryConverter {
     private static final int MTI_LENGTH = 4;
     private static final int BITMAP_HEX_LENGTH = 32; 
     private static final int TOTAL_PREFIX_LENGTH = MTI_LENGTH + BITMAP_HEX_LENGTH;
-    // Definimos el salto de línea explícitamente como un byte LF (Line Feed)
-    private static final byte[] NEWLINE_BYTE = { (byte)'\n' };
 
     public static void main(String[] args) {
         String inputFileBasePath = null;
         String outputFileBasePath = null;
 
+        // 1. Leer parámetros
         for (int i = 0; i < args.length; i++) {
             if ("--input".equals(args[i]) && i + 1 < args.length) {
                 inputFileBasePath = args[i + 1];
@@ -29,85 +28,56 @@ public class IsoBitmapHexToBinaryConverter {
         }
 
         if (inputFileBasePath == null || outputFileBasePath == null) {
-            System.err.println("Error: Faltan parametros --input y --output");
+            System.err.println("Error: Faltan parametros.");
             System.exit(1);
         }
 
         File inputFile = new File(inputFileBasePath);
         File outputFile = new File(outputFileBasePath);
 
-        System.out.println("Iniciando modo binario estricto para AS/400...");
-
+        // Variables fuera del try para poder cerrarlas en el finally (Java antiguo)
         BufferedReader reader = null;
-        // Usamos FileOutputStream directamente para evitar cualquier buffer intermedio que pueda intentar codificar texto
-        FileOutputStream writer = null;
+        BufferedOutputStream writer = null;
 
         try {
-            // Lectura: Forzamos US-ASCII para leer el texto de entrada correctamente
+            // Leemos el archivo de entrada como ASCII puro
             reader = new BufferedReader(new InputStreamReader(new FileInputStream(inputFile), "US-ASCII"));
-            // Escritura: Flujo de bytes puro
-            writer = new FileOutputStream(outputFile);
+            writer = new BufferedOutputStream(new FileOutputStream(outputFile));
 
             String line;
-            int lineNumber = 0;
-            int processedCount = 0;
-
             while ((line = reader.readLine()) != null) {
-                lineNumber++;
-
-                if (line.length() < TOTAL_PREFIX_LENGTH) {
-                    continue;
-                }
+                if (line.length() < TOTAL_PREFIX_LENGTH) continue;
 
                 try {
-                    // 1. Separar las partes como Strings
                     String mtiStr = line.substring(0, MTI_LENGTH);
                     String hexBitmapStr = line.substring(MTI_LENGTH, TOTAL_PREFIX_LENGTH);
                     String restOfDataStr = line.substring(TOTAL_PREFIX_LENGTH);
 
-                    // 2. Convertir cada parte a su representación en BYTES pura
-                    byte[] mtiBytes = mtiStr.getBytes("US-ASCII");
-                    // Esta es la parte clave: conversión hex a binario puro
-                    byte[] bitmapBytes = hexStringToByteArray(hexBitmapStr);
-                    byte[] restBytes = restOfDataStr.getBytes("US-ASCII");
+                    // PASO 1: Convertir el Hex (ej: "80...") a Bytes crudos (ej: 0x80)
+                    byte[] rawBytes = hexStringToByteArray(hexBitmapStr);
 
-                    // 3. Calcular el tamaño total de la línea final en bytes
-                    int totalLineLength = mtiBytes.length + bitmapBytes.length + restBytes.length + NEWLINE_BYTE.length;
-                    
-                    // 4. Crear un único array gigante para toda la línea
-                    byte[] finalLineBytes = new byte[totalLineLength];
+                    // PASO 2 (LA CLAVE): Simular la conversión original de AS/400.
+                    // Interpretamos esos bytes como si fueran EBCDIC (Cp1047).
+                    // Esto hace que 0x80 se convierta en el caracter 'Ø'.
+                    String simulatedEbcdicStr = new String(rawBytes, "Cp1047");
 
-                    // 5. Ensamblar las partes en el array gigante usando System.arraycopy (muy rápido y seguro)
-                    int currentOffset = 0;
-                    
-                    // Copiar MTI
-                    System.arraycopy(mtiBytes, 0, finalLineBytes, currentOffset, mtiBytes.length);
-                    currentOffset += mtiBytes.length;
-                    
-                    // Copiar Bitmap Binario (Aquí es donde se protege el 0x80)
-                    System.arraycopy(bitmapBytes, 0, finalLineBytes, currentOffset, bitmapBytes.length);
-                    currentOffset += bitmapBytes.length;
-                    
-                    // Copiar Resto de datos
-                    System.arraycopy(restBytes, 0, finalLineBytes, currentOffset, restBytes.length);
-                    currentOffset += restBytes.length;
-                    
-                    // Copiar Salto de línea
-                    System.arraycopy(NEWLINE_BYTE, 0, finalLineBytes, currentOffset, NEWLINE_BYTE.length);
+                    // PASO 3: Guardar ese resultado como UTF-8.
+                    // Esto hace que la 'Ø' se convierta en los bytes C3 98.
+                    byte[] finalOutputBytes = simulatedEbcdicStr.getBytes("UTF-8");
 
-                    // 6. ESCRITURA ATÓMICA: Escribir todo el bloque de bytes de una sola vez
-                    writer.write(finalLineBytes);
-
-                    processedCount++;
+                    // --- ESCRITURA ---
+                    writer.write(mtiStr.getBytes("US-ASCII")); // MTI
+                    writer.write(finalOutputBytes);            // Bitmap (ahora será C3 98...)
+                    writer.write(restOfDataStr.getBytes("US-ASCII")); // Resto
+                    writer.write('\n'); // Salto de línea
 
                 } catch (Exception e) {
-                     System.err.println("Error en linea " + lineNumber + ": " + e.getMessage());
+                    System.err.println("Error procesando linea: " + e.getMessage());
                 }
             }
             
-            // Asegurar que todo se escriba en disco
             writer.flush();
-            System.out.println("Procesamiento finalizado. Registros: " + processedCount);
+            System.out.println("Proceso completado. Se genero el formato UTF-8 simulado.");
 
         } catch (IOException e) {
             e.printStackTrace();
@@ -115,20 +85,17 @@ public class IsoBitmapHexToBinaryConverter {
             try {
                 if (reader != null) reader.close();
                 if (writer != null) writer.close();
-            } catch (IOException ex) { }
+            } catch (Exception ex) {}
         }
     }
 
-    // Este método no cambia, ya funcionaba bien, el problema era al escribir el resultado
     private static byte[] hexStringToByteArray(String s) {
         int len = s.length();
-        if (len % 2 != 0) throw new IllegalArgumentException("Longitud hex impar");
         byte[] data = new byte[len / 2];
         for (int i = 0; i < len; i += 2) {
             int digit1 = Character.digit(s.charAt(i), 16);
             int digit2 = Character.digit(s.charAt(i + 1), 16);
-            if (digit1 == -1 || digit2 == -1) throw new IllegalArgumentException("Caracter no hex");
-            // Esto genera el byte puro, ej: 0x80
+            if (digit1 == -1 || digit2 == -1) { digit1=0; digit2=0; }
             data[i / 2] = (byte) ((digit1 << 4) + digit2);
         }
         return data;
