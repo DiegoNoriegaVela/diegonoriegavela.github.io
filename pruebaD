@@ -1,95 +1,146 @@
-import java.io.*;
+import java.io.BufferedReader;
+import java.io.BufferedOutputStream;
+import java.io.File;
+import java.io.FileReader;
+import java.io.FileOutputStream;
+import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 
-public class IsoRawConverter {
+public class IsoBitmapHexToBinaryConverter {
+
+    // Definimos las longitudes estándar según tu descripción
+    private static final int MTI_LENGTH = 4;
+    private static final int BITMAP_HEX_LENGTH = 32; // 32 chars hex = 128 bits = 16 bytes binarios
+    private static final int TOTAL_PREFIX_LENGTH = MTI_LENGTH + BITMAP_HEX_LENGTH;
 
     public static void main(String[] args) {
-        String inputPath = null;
+        String inputFileBasePath = null;
+        String outputFileBasePath = null;
 
-        // Leer argumento --input
+        // 1. Procesamiento de parámetros de línea de comandos
         for (int i = 0; i < args.length; i++) {
             if ("--input".equals(args[i]) && i + 1 < args.length) {
-                inputPath = args[i + 1];
+                inputFileBasePath = args[i + 1];
+                i++;
+            } else if ("--output".equals(args[i]) && i + 1 < args.length) {
+                outputFileBasePath = args[i + 1];
+                i++;
             }
         }
 
-        if (inputPath == null) {
-            System.err.println("❌ Error: Indica el archivo con --input");
-            System.err.println("Ejemplo: java IsoRawConverter --input \"Ruta/Del/Archivo\"");
-            return;
+        // Validación de parámetros
+        if (inputFileBasePath == null || outputFileBasePath == null) {
+            System.err.println("Error: Faltan parámetros.");
+            System.err.println("Uso: java IsoBitmapHexToBinaryConverter --input <ruta_archivo_origen> --output <ruta_archivo_destino>");
+            System.exit(1);
         }
 
-        String outputPath = inputPath + "_BINARIO_EXPANDIDO.txt";
-        System.out.println("🔄 Procesando trama con Bitmap Binario (Raw)...");
+        File inputFile = new File(inputFileBasePath);
+        File outputFile = new File(outputFileBasePath);
 
-        // USAMOS ISO_8859_1: Fundamental para leer los bytes "raros" tal cual son (1 byte = 1 char)
-        try (BufferedReader br = new BufferedReader(new InputStreamReader(new FileInputStream(inputPath), StandardCharsets.ISO_8859_1));
-             BufferedWriter bw = new BufferedWriter(new FileWriter(outputPath))) {
+        if (!inputFile.exists() || !inputFile.isFile()) {
+            System.err.println("Error: El archivo de entrada no existe o no es válido: " + inputFileBasePath);
+            System.exit(1);
+        }
+
+        System.out.println("Iniciando procesamiento...");
+        System.out.println("Entrada (Hex Bitmap): " + inputFile.getAbsolutePath());
+        System.out.println("Salida (Bin Bitmap): " + outputFile.getAbsolutePath());
+
+        // 2. Proceso de lectura y conversión
+        // Usamos BufferedReader para leer el origen como texto (línea por línea)
+        // Usamos BufferedOutputStream para escribir el destino porque contendrá datos binarios mixtos
+        try (BufferedReader reader = new BufferedReader(new FileReader(inputFile, StandardCharsets.US_ASCII));
+             BufferedOutputStream writer = new BufferedOutputStream(new FileOutputStream(outputFile))) {
 
             String line;
-            int contador = 0;
+            int lineNumber = 0;
+            int processedCount = 0;
 
-            while ((line = br.readLine()) != null) {
-                contador++;
-                // Validación mínima: MTI (4) + Bitmap Raw (16) = 20 chars mínimo
-                if (line.length() < 20) {
-                    bw.write(line); 
-                    bw.newLine(); 
-                    continue; 
+            // Leemos el archivo línea por línea
+            while ((line = reader.readLine()) != null) {
+                lineNumber++;
+
+                // Validación básica: la línea debe tener al menos la longitud del MTI + Bitmap Hex
+                if (line.length() < TOTAL_PREFIX_LENGTH) {
+                    System.err.println("Advertencia: Línea " + lineNumber + " omitida por ser demasiado corta: " + line);
+                    continue;
                 }
 
                 try {
-                    // 1. MTI: Primeros 4 caracteres (ej: 1644, 1240)
-                    String mti = line.substring(0, 4);
+                    // A. Extraer el MTI (primeros 4 caracteres) - NO SE TOCA
+                    String mtiStr = line.substring(0, MTI_LENGTH);
 
-                    // 2. BITMAP ORIGINAL (RAW): Tomamos los siguientes 16 caracteres exactos
-                    // Aunque parezcan símbolos raros (Ã, ~, cuadros), son los datos reales.
-                    String bitmapRaw = line.substring(4, 20);
+                    // B. Extraer el Bitmap en Hexadecimal (siguientes 32 caracteres) - ESTO SE CONVERTIRÁ
+                    String hexBitmapStr = line.substring(MTI_LENGTH, TOTAL_PREFIX_LENGTH);
 
-                    // 3. RESTO: Todo lo que sigue después del byte 20
-                    String restoTrama = line.substring(20);
+                    // C. Extraer el resto de la trama (desde el carácter 36 en adelante) - NO SE TOCA
+                    String restOfDataStr = line.substring(TOTAL_PREFIX_LENGTH);
 
-                    // 4. CONVERSIÓN: Expandimos esos 16 bytes a 128 unos y ceros
-                    String bitmapBinario = rawToBinario(bitmapRaw);
+                    // --- FASE DE CONVERSIÓN ---
+                    // Convertir la cadena hexadecimal de 32 chars a un array de 16 bytes binarios
+                    byte[] binaryBitmap = hexStringToByteArray(hexBitmapStr);
 
-                    // 5. GUARDAR: MTI + [128 bits visuales] + Resto
-                    bw.write(mti + bitmapBinario + restoTrama);
-                    bw.newLine();
+                    // --- FASE DE ESCRITURA ---
+                    // Escribimos los bytes en el orden correcto al archivo de salida
 
-                } catch (Exception e) {
-                    System.err.println("⚠️ Alerta en línea " + contador + ": " + e.getMessage());
-                    bw.write(line); // Copiamos original si hay error
-                    bw.newLine();
+                    // 1. Escribir MTI como bytes ASCII
+                    writer.write(mtiStr.getBytes(StandardCharsets.US_ASCII));
+
+                    // 2. Escribir el Bitmap convertido como bytes BINARIOS puros
+                    writer.write(binaryBitmap);
+
+                    // 3. Escribir el resto de los datos como bytes ASCII
+                    writer.write(restOfDataStr.getBytes(StandardCharsets.US_ASCII));
+
+                    // 4. Añadir salto de línea (importante si el archivo original tenía múltiples líneas)
+                    // Usamos un salto de línea estándar ASCII
+                    writer.write('\n');
+
+                    processedCount++;
+
+                } catch (IllegalArgumentException e) {
+                    System.err.println("Error en línea " + lineNumber + ": El bitmap no es una cadena hexadecimal válida (" + line.substring(MTI_LENGTH, TOTAL_PREFIX_LENGTH) + "). Línea omitida.");
+                } catch (StringIndexOutOfBoundsException e) {
+                     System.err.println("Error de índice en línea " + lineNumber + ". Línea omitida.");
                 }
             }
-            System.out.println("✅ ¡Listo! Archivo generado: " + outputPath);
+
+            // Asegurar que todos los datos se escriban en el disco
+            writer.flush();
+            System.out.println("Procesamiento finalizado. Se convirtieron " + processedCount + " registros exitosamente.");
 
         } catch (IOException e) {
+            System.err.println("Error crítico de Entrada/Salida:");
             e.printStackTrace();
         }
     }
 
     /**
-     * Toma una cadena de caracteres "raw" (bytes crudos).
-     * Convierte cada caracter a su representación de 8 bits.
-     * 16 chars de entrada -> 128 chars de salida (0s y 1s).
+     * Método auxiliar crítico.
+     * Convierte una cadena hexadecimal (ej: "F010") en su representación de bytes binarios.
+     * Se asume fielmente que la entrada es una cadena hex válida de longitud par.
+     * @param s La cadena hexadecimal (debe ser de 32 caracteres para este caso de uso).
+     * @return El array de bytes resultante (será de 16 bytes).
      */
-    private static String rawToBinario(String raw) {
-        StringBuilder sb = new StringBuilder();
-        for (char c : raw.toCharArray()) {
-            // Obtenemos el valor del byte (0 a 255)
-            int valorByte = c & 0xFF;
-            
-            // Convertimos a string binario (ej: "1100")
-            String bin = Integer.toBinaryString(valorByte);
-            
-            // Rellenamos con ceros a la izquierda para asegurar 8 bits por byte
-            // Ej: "11" -> "00000011"
-            while (bin.length() < 8) {
-                bin = "0" + bin;
-            }
-            sb.append(bin);
+    private static byte[] hexStringToByteArray(String s) {
+        int len = s.length();
+        if (len % 2 != 0) {
+             throw new IllegalArgumentException("La cadena hexadecimal debe tener una longitud par");
         }
-        return sb.toString();
+        byte[] data = new byte[len / 2];
+        for (int i = 0; i < len; i += 2) {
+            // Toma dos caracteres hex, los convierte a dígitos numéricos y los combina en un byte
+            int digit1 = Character.digit(s.charAt(i), 16);
+            int digit2 = Character.digit(s.charAt(i + 1), 16);
+
+            if (digit1 == -1 || digit2 == -1) {
+                 throw new IllegalArgumentException("Carácter no hexadecimal encontrado en el bitmap");
+            }
+
+            data[i / 2] = (byte) ((digit1 << 4) + digit2);
+        }
+        return data;
     }
 }
+
