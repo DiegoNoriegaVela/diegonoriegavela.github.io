@@ -1,97 +1,95 @@
 import java.io.*;
-import java.util.*;
+import java.nio.charset.StandardCharsets;
 
-public class IsoLogConverter {
-    
+public class IsoRawConverter {
+
     public static void main(String[] args) {
-        if (args.length < 2) {
-            System.out.println("Uso: java IsoLogConverter --input <ruta_archivo>");
+        String inputPath = null;
+
+        // Leer argumento --input
+        for (int i = 0; i < args.length; i++) {
+            if ("--input".equals(args[i]) && i + 1 < args.length) {
+                inputPath = args[i + 1];
+            }
+        }
+
+        if (inputPath == null) {
+            System.err.println("❌ Error: Indica el archivo con --input");
+            System.err.println("Ejemplo: java IsoRawConverter --input \"Ruta/Del/Archivo\"");
             return;
         }
-        
-        String inputPath = args[1];
-        convertFile(inputPath);
-    }
-    
-    public static void convertFile(String inputPath) {
-        try {
-            BufferedReader reader = new BufferedReader(new FileReader(inputPath));
-            String outputPath = inputPath.replaceAll("(\\.[^.]+)?$", ".binary");
-            FileOutputStream fos = new FileOutputStream(outputPath);
-            
+
+        String outputPath = inputPath + "_BINARIO_EXPANDIDO.txt";
+        System.out.println("🔄 Procesando trama con Bitmap Binario (Raw)...");
+
+        // USAMOS ISO_8859_1: Fundamental para leer los bytes "raros" tal cual son (1 byte = 1 char)
+        try (BufferedReader br = new BufferedReader(new InputStreamReader(new FileInputStream(inputPath), StandardCharsets.ISO_8859_1));
+             BufferedWriter bw = new BufferedWriter(new FileWriter(outputPath))) {
+
             String line;
-            int lineNum = 0;
-            
-            while ((line = reader.readLine()) != null) {
-                lineNum++;
-                
-                // Línea 2 es el bitmap (después del MTI)
-                if (lineNum == 2) {
-                    // Convertir bitmap de formato especial a hex binario
-                    byte[] bitmapBytes = convertBitmapToBinary(line.trim());
-                    fos.write(bitmapBytes);
-                } else {
-                    // Escribir otras líneas tal cual
-                    fos.write(line.getBytes("ISO-8859-1"));
+            int contador = 0;
+
+            while ((line = br.readLine()) != null) {
+                contador++;
+                // Validación mínima: MTI (4) + Bitmap Raw (16) = 20 chars mínimo
+                if (line.length() < 20) {
+                    bw.write(line); 
+                    bw.newLine(); 
+                    continue; 
                 }
-                
-                fos.write('\n');
+
+                try {
+                    // 1. MTI: Primeros 4 caracteres (ej: 1644, 1240)
+                    String mti = line.substring(0, 4);
+
+                    // 2. BITMAP ORIGINAL (RAW): Tomamos los siguientes 16 caracteres exactos
+                    // Aunque parezcan símbolos raros (Ã, ~, cuadros), son los datos reales.
+                    String bitmapRaw = line.substring(4, 20);
+
+                    // 3. RESTO: Todo lo que sigue después del byte 20
+                    String restoTrama = line.substring(20);
+
+                    // 4. CONVERSIÓN: Expandimos esos 16 bytes a 128 unos y ceros
+                    String bitmapBinario = rawToBinario(bitmapRaw);
+
+                    // 5. GUARDAR: MTI + [128 bits visuales] + Resto
+                    bw.write(mti + bitmapBinario + restoTrama);
+                    bw.newLine();
+
+                } catch (Exception e) {
+                    System.err.println("⚠️ Alerta en línea " + contador + ": " + e.getMessage());
+                    bw.write(line); // Copiamos original si hay error
+                    bw.newLine();
+                }
             }
-            
-            reader.close();
-            fos.close();
-            
-            System.out.println("Conversión exitosa: " + outputPath);
-            
+            System.out.println("✅ ¡Listo! Archivo generado: " + outputPath);
+
         } catch (IOException e) {
-            System.err.println("Error: " + e.getMessage());
             e.printStackTrace();
         }
     }
-    
-    private static byte[] convertBitmapToBinary(String bitmapStr) {
-        // El bitmap viene como string de 36 caracteres
-        // Necesitamos convertirlo a 16 bytes hex
-        
-        // Primero, identificar el formato correcto
-        // Si son 36 chars, tomar grupos de formato específico
-        
-        // Basándome en el ejemplo: 8000001000001000000200000000000000
-        // Esto parece ser un formato propietario o BCD
-        
-        // Por ahora, si tiene 32+ caracteres hex válidos, convertir
-        if (bitmapStr.length() >= 32 && isAllHex(bitmapStr.substring(0, 32))) {
-            return hexToBytes(bitmapStr.substring(0, 32));
-        }
-        
-        // Si no, retornar como está
-        return bitmapStr.getBytes();
-    }
-    
-    private static boolean isAllHex(String str) {
-        for (char c : str.toCharArray()) {
-            if (!isHexChar(c)) {
-                return false;
+
+    /**
+     * Toma una cadena de caracteres "raw" (bytes crudos).
+     * Convierte cada caracter a su representación de 8 bits.
+     * 16 chars de entrada -> 128 chars de salida (0s y 1s).
+     */
+    private static String rawToBinario(String raw) {
+        StringBuilder sb = new StringBuilder();
+        for (char c : raw.toCharArray()) {
+            // Obtenemos el valor del byte (0 a 255)
+            int valorByte = c & 0xFF;
+            
+            // Convertimos a string binario (ej: "1100")
+            String bin = Integer.toBinaryString(valorByte);
+            
+            // Rellenamos con ceros a la izquierda para asegurar 8 bits por byte
+            // Ej: "11" -> "00000011"
+            while (bin.length() < 8) {
+                bin = "0" + bin;
             }
+            sb.append(bin);
         }
-        return true;
-    }
-    
-    private static boolean isHexChar(char c) {
-        return (c >= '0' && c <= '9') || 
-               (c >= 'A' && c <= 'F') || 
-               (c >= 'a' && c <= 'f');
-    }
-    
-    private static byte[] hexToBytes(String hex) {
-        int len = hex.length();
-        byte[] bytes = new byte[len / 2];
-        
-        for (int i = 0; i < len; i += 2) {
-            bytes[i / 2] = (byte) ((Character.digit(hex.charAt(i), 16) << 4)
-                                 + Character.digit(hex.charAt(i+1), 16));
-        }
-        
-        return bytes;
+        return sb.toString();
     }
 }
