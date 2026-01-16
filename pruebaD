@@ -1,27 +1,115 @@
-/**
- * Crea un archivo temporal con nombre basado en prefijo + timestamp
- * 
- * Formato: {prefix}_YYYYMMDDHHMMSS.ipm
- * Ejemplo: R11902840_20260116114719.ipm
- * 
- * @param prefix Prefijo del nombre (ej: "R11902840", "T112")
- * @return File objeto apuntando al archivo temporal creado
- * @throws IOException Si ocurre error al crear el archivo
- */
-private static File createTempFile(String prefix) throws IOException {
-    // Generar timestamp: YYYYMMDDHHMMSS
-    SimpleDateFormat sdf = new SimpleDateFormat("yyyyMMddHHmmss");
-    String timestamp = sdf.format(new Date());
-    
-    // Construir nombre: prefix_timestamp.ipm
-    String fileName = prefix + "_" + timestamp + ".ipm";
-    
-    // Crear archivo en directorio actual
-    File tempFile = new File(fileName);
-    
-    if (DEBUG) {
-        System.out.println("DEBUG: Archivo temporal creado: " + tempFile.getAbsolutePath());
+import java.io.*;
+import java.nio.file.*;
+import java.util.HashMap;
+import java.util.Map;
+
+public class IsoLogConverter {
+
+    // Mapa estático para conversión ultra rápida de Hex a Binario (4 bits)
+    private static final Map<Character, String> HEX_A_BIN = new HashMap<>();
+    static {
+        HEX_A_BIN.put('0', "0000"); HEX_A_BIN.put('1', "0001");
+        HEX_A_BIN.put('2', "0010"); HEX_A_BIN.put('3', "0011");
+        HEX_A_BIN.put('4', "0100"); HEX_A_BIN.put('5', "0101");
+        HEX_A_BIN.put('6', "0110"); HEX_A_BIN.put('7', "0111");
+        HEX_A_BIN.put('8', "1000"); HEX_A_BIN.put('9', "1001");
+        HEX_A_BIN.put('A', "1010"); HEX_A_BIN.put('B', "1011");
+        HEX_A_BIN.put('C', "1100"); HEX_A_BIN.put('D', "1101");
+        HEX_A_BIN.put('E', "1110"); HEX_A_BIN.put('F', "1111");
     }
-    
-    return tempFile;
+
+    public static void main(String[] args) {
+        String inputPath = null;
+
+        // 1. Parsing de argumentos para aceptar "--input <ruta>"
+        for (int i = 0; i < args.length; i++) {
+            if ("--input".equals(args[i]) && i + 1 < args.length) {
+                inputPath = args[i + 1];
+            }
+        }
+
+        if (inputPath == null) {
+            System.err.println("❌ Error: Debes especificar el archivo de entrada.");
+            System.err.println("Uso: java IsoLogConverter --input \"/ruta/al/archivo/GCOFILE_DATI\"");
+            return;
+        }
+
+        // Definir archivo de salida (agrega _BIN al nombre original)
+        String outputPath = inputPath + "_BINARIO.txt";
+
+        System.out.println("------------------------------------------------");
+        System.out.println("🔄 Iniciando conversión de ISO 8583 (Bitmap Hex -> Binario)...");
+        System.out.println("📂 Entrada: " + inputPath);
+        System.out.println("------------------------------------------------");
+
+        try (BufferedReader br = new BufferedReader(new FileReader(inputPath));
+             BufferedWriter bw = new BufferedWriter(new FileWriter(outputPath))) {
+
+            String line;
+            int lineNumber = 0;
+
+            while ((line = br.readLine()) != null) {
+                lineNumber++;
+                line = line.trim();
+
+                // Validación básica: La trama debe tener al menos 4 (MTI) + 32 (Bitmap) caracteres
+                if (line.length() < 36) {
+                    bw.write(line); // Escribimos la línea tal cual si no cumple el formato
+                    bw.newLine();
+                    continue;
+                }
+
+                try {
+                    // --- LÓGICA CORE ---
+                    
+                    // 1. MTI: Primeros 4 caracteres (0 a 4)
+                    String mti = line.substring(0, 4);
+
+                    // 2. Bitmap Hex: Siguientes 32 caracteres (4 a 36)
+                    String bitmapHex = line.substring(4, 36);
+
+                    // 3. Data Restante: Del caracter 36 al final
+                    String restoTrama = line.substring(36);
+
+                    // 4. Conversión del Bitmap
+                    String bitmapBinario = convertirHexABinario(bitmapHex);
+
+                    // 5. Reconstrucción y escritura
+                    bw.write(mti + bitmapBinario + restoTrama);
+                    bw.newLine();
+
+                } catch (Exception e) {
+                    System.err.println("⚠️ Error procesando línea " + lineNumber + ": " + e.getMessage());
+                    bw.write(line); // Si falla, escribimos la original para no perder data
+                    bw.newLine();
+                }
+            }
+
+            System.out.println("✅ ¡Proceso completado!");
+            System.out.println("📄 Archivo generado: " + outputPath);
+
+        } catch (IOException e) {
+            System.err.println("❌ Error de lectura/escritura: " + e.getMessage());
+        }
+    }
+
+    /**
+     * Convierte una cadena Hexadecimal de 32 caracteres a una cadena Binaria de 128 caracteres.
+     * Mantiene los ceros a la izquierda.
+     */
+    private static String convertirHexABinario(String hex) {
+        StringBuilder binario = new StringBuilder(128); // Capacidad exacta para evitar redimensionamiento
+        
+        for (char c : hex.toCharArray()) {
+            // Convertimos a mayúscula por seguridad y buscamos en el mapa
+            String bits = HEX_A_BIN.get(Character.toUpperCase(c));
+            if (bits != null) {
+                binario.append(bits);
+            } else {
+                // Si encontramos un caracter no hex (basura), devolvemos "0000" o manejamos error
+                binario.append("0000"); 
+            }
+        }
+        return binario.toString();
+    }
 }
