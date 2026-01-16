@@ -14,54 +14,64 @@ public class IsoLogConverter {
     }
     
     public static void convertFile(String inputPath) {
+        BufferedReader reader = null;
+        FileOutputStream fos = null;
+        
         try {
-            // Leer el archivo original
-            Path path = Paths.get(inputPath);
-            List<String> lines = Files.readAllLines(path);
+            // Archivo de entrada
+            reader = new BufferedReader(new FileReader(inputPath));
             
-            // Crear archivo de salida
+            // Archivo de salida
             String outputPath = inputPath.replaceAll("(\\.[^.]+)?$", ".binary");
-            FileOutputStream fos = new FileOutputStream(outputPath);
+            fos = new FileOutputStream(outputPath);
             
-            for (String line : lines) {
+            String line;
+            while ((line = reader.readLine()) != null) {
+                // Procesar solo si la línea tiene al menos MTI (4) + Bitmap (32) = 36 caracteres
                 if (line.length() >= 36) {
                     // MTI: primeros 4 caracteres
                     String mti = line.substring(0, 4);
                     
-                    // Bitmap: siguientes 32 caracteres en hex
+                    // Bitmap: siguientes 32 caracteres (en hexadecimal)
                     String bitmapHex = line.substring(4, 36);
                     
-                    // Resto de la línea
-                    String resto = line.substring(36);
+                    // Resto de la línea (sin modificar)
+                    String resto = line.length() > 36 ? line.substring(36) : "";
                     
-                    // Escribir MTI en ASCII
+                    // Escribir MTI
                     fos.write(mti.getBytes("ISO-8859-1"));
                     
-                    // Convertir y escribir bitmap como bytes binarios
-                    byte[] bitmapBytes = hexToBytes(bitmapHex);
-                    fos.write(bitmapBytes);
+                    // Convertir bitmap hex a binario y escribir
+                    byte[] bitmapBinary = hexToBytes(bitmapHex);
+                    fos.write(bitmapBinary);
                     
-                    // Escribir el resto en ASCII
+                    // Escribir el resto
                     fos.write(resto.getBytes("ISO-8859-1"));
-                    fos.write('\n');
                     
                 } else {
-                    // Línea corta, escribir tal cual
+                    // Línea muy corta, escribir tal cual
                     fos.write(line.getBytes("ISO-8859-1"));
-                    fos.write('\n');
                 }
+                
+                // Salto de línea
+                fos.write('\n');
             }
             
-            fos.close();
-            System.out.println("Archivo convertido exitosamente: " + outputPath);
+            System.out.println("Conversión exitosa: " + outputPath);
             
         } catch (IOException e) {
-            System.err.println("Error procesando archivo: " + e.getMessage());
+            System.err.println("Error: " + e.getMessage());
             e.printStackTrace();
+        } finally {
+            try {
+                if (reader != null) reader.close();
+                if (fos != null) fos.close();
+            } catch (IOException e) {
+                e.printStackTrace();
+            }
         }
     }
     
-    // Convierte string hexadecimal a bytes
     private static byte[] hexToBytes(String hex) {
         int len = hex.length();
         byte[] bytes = new byte[len / 2];
