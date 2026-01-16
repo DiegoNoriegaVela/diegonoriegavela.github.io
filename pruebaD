@@ -15,38 +15,44 @@ public class IsoLogConverter {
     
     public static void convertFile(String inputPath) {
         try {
-            // Leer todas las líneas del archivo
+            // Leer el archivo original
             Path path = Paths.get(inputPath);
-            String content = new String(Files.readAllBytes(path));
+            List<String> lines = Files.readAllLines(path);
             
-            // Separar por líneas
-            String[] lines = content.split("\n");
-            StringBuilder output = new StringBuilder();
+            // Crear archivo de salida
+            String outputPath = inputPath.replaceAll("(\\.[^.]+)?$", ".binary");
+            FileOutputStream fos = new FileOutputStream(outputPath);
             
             for (String line : lines) {
-                if (line.length() >= 32) {
-                    // Extraer los primeros 32 caracteres (bitmap en hex)
-                    String bitmapHex = line.substring(0, 32);
-                    String resto = line.substring(32);
+                if (line.length() >= 36) {
+                    // MTI: primeros 4 caracteres
+                    String mti = line.substring(0, 4);
                     
-                    // Convertir hex a bytes
+                    // Bitmap: siguientes 32 caracteres en hex
+                    String bitmapHex = line.substring(4, 36);
+                    
+                    // Resto de la línea
+                    String resto = line.substring(36);
+                    
+                    // Escribir MTI en ASCII
+                    fos.write(mti.getBytes("ISO-8859-1"));
+                    
+                    // Convertir y escribir bitmap como bytes binarios
                     byte[] bitmapBytes = hexToBytes(bitmapHex);
+                    fos.write(bitmapBytes);
                     
-                    // Convertir bytes de vuelta a string para escribir
-                    String bitmapBinary = bytesToString(bitmapBytes);
+                    // Escribir el resto en ASCII
+                    fos.write(resto.getBytes("ISO-8859-1"));
+                    fos.write('\n');
                     
-                    output.append(bitmapBinary).append(resto).append("\n");
                 } else {
-                    output.append(line).append("\n");
+                    // Línea corta, escribir tal cual
+                    fos.write(line.getBytes("ISO-8859-1"));
+                    fos.write('\n');
                 }
             }
             
-            // Crear nombre del archivo de salida
-            String outputPath = inputPath.replaceAll("(\\.[^.]+)?$", ".binary");
-            
-            // Escribir el archivo de salida
-            Files.write(Paths.get(outputPath), output.toString().getBytes());
-            
+            fos.close();
             System.out.println("Archivo convertido exitosamente: " + outputPath);
             
         } catch (IOException e) {
@@ -66,10 +72,5 @@ public class IsoLogConverter {
         }
         
         return bytes;
-    }
-    
-    // Convierte bytes a string (para escribir en archivo)
-    private static String bytesToString(byte[] bytes) {
-        return new String(bytes);
     }
 }
