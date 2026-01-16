@@ -1,5 +1,5 @@
 import java.io.*;
-import java.nio.file.*;
+import java.util.*;
 
 public class IsoLogConverter {
     
@@ -14,62 +14,73 @@ public class IsoLogConverter {
     }
     
     public static void convertFile(String inputPath) {
-        BufferedReader reader = null;
-        FileOutputStream fos = null;
-        
         try {
-            // Archivo de entrada
-            reader = new BufferedReader(new FileReader(inputPath));
-            
-            // Archivo de salida
+            BufferedReader reader = new BufferedReader(new FileReader(inputPath));
             String outputPath = inputPath.replaceAll("(\\.[^.]+)?$", ".binary");
-            fos = new FileOutputStream(outputPath);
+            FileOutputStream fos = new FileOutputStream(outputPath);
             
             String line;
+            int lineNum = 0;
+            
             while ((line = reader.readLine()) != null) {
-                // Procesar solo si la línea tiene al menos MTI (4) + Bitmap (32) = 36 caracteres
-                if (line.length() >= 36) {
-                    // MTI: primeros 4 caracteres
-                    String mti = line.substring(0, 4);
-                    
-                    // Bitmap: siguientes 32 caracteres (en hexadecimal)
-                    String bitmapHex = line.substring(4, 36);
-                    
-                    // Resto de la línea (sin modificar)
-                    String resto = line.length() > 36 ? line.substring(36) : "";
-                    
-                    // Escribir MTI
-                    fos.write(mti.getBytes("ISO-8859-1"));
-                    
-                    // Convertir bitmap hex a binario y escribir
-                    byte[] bitmapBinary = hexToBytes(bitmapHex);
-                    fos.write(bitmapBinary);
-                    
-                    // Escribir el resto
-                    fos.write(resto.getBytes("ISO-8859-1"));
-                    
+                lineNum++;
+                
+                // Línea 2 es el bitmap (después del MTI)
+                if (lineNum == 2) {
+                    // Convertir bitmap de formato especial a hex binario
+                    byte[] bitmapBytes = convertBitmapToBinary(line.trim());
+                    fos.write(bitmapBytes);
                 } else {
-                    // Línea muy corta, escribir tal cual
+                    // Escribir otras líneas tal cual
                     fos.write(line.getBytes("ISO-8859-1"));
                 }
                 
-                // Salto de línea
                 fos.write('\n');
             }
+            
+            reader.close();
+            fos.close();
             
             System.out.println("Conversión exitosa: " + outputPath);
             
         } catch (IOException e) {
             System.err.println("Error: " + e.getMessage());
             e.printStackTrace();
-        } finally {
-            try {
-                if (reader != null) reader.close();
-                if (fos != null) fos.close();
-            } catch (IOException e) {
-                e.printStackTrace();
+        }
+    }
+    
+    private static byte[] convertBitmapToBinary(String bitmapStr) {
+        // El bitmap viene como string de 36 caracteres
+        // Necesitamos convertirlo a 16 bytes hex
+        
+        // Primero, identificar el formato correcto
+        // Si son 36 chars, tomar grupos de formato específico
+        
+        // Basándome en el ejemplo: 8000001000001000000200000000000000
+        // Esto parece ser un formato propietario o BCD
+        
+        // Por ahora, si tiene 32+ caracteres hex válidos, convertir
+        if (bitmapStr.length() >= 32 && isAllHex(bitmapStr.substring(0, 32))) {
+            return hexToBytes(bitmapStr.substring(0, 32));
+        }
+        
+        // Si no, retornar como está
+        return bitmapStr.getBytes();
+    }
+    
+    private static boolean isAllHex(String str) {
+        for (char c : str.toCharArray()) {
+            if (!isHexChar(c)) {
+                return false;
             }
         }
+        return true;
+    }
+    
+    private static boolean isHexChar(char c) {
+        return (c >= '0' && c <= '9') || 
+               (c >= 'A' && c <= 'F') || 
+               (c >= 'a' && c <= 'f');
     }
     
     private static byte[] hexToBytes(String hex) {
