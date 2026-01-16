@@ -4,630 +4,412 @@ import java.util.ArrayList;
 import java.util.List;
 
 /**
- * IpmConverter - Conversor de Archivos IPM entre formatos EBCDIC y ASCII
+ * IpmConverter - Conversor de Archivos Mastercard EBCDIC <-> ASCII
  * 
- * Herramienta especializada para convertir archivos IPM (Interchange Processing Messages)
- * de Mastercard entre formato binario EBCDIC con RDW/1014-blocking y formato texto ASCII.
+ * ARQUITECTURA:
  * 
- * FORMATO DE ARCHIVO IPM (EBCDIC):
+ * Este conversor maneja dos tipos de archivos de Mastercard:
  * 
- * Los archivos IPM utilizan una estructura de tres capas segun el manual de Mastercard:
+ * 1. ARCHIVOS IPM (Interchange Processing Messages):
+ *    - R111, R119, T112, T120, RSP1, RSP3
+ *    - Estructura: RDW (4 bytes) + VBS + 1014-blocking
+ *    - Usan metodos: encodeIpm() / decodeIpm()
  * 
- * 1. CAPA RDW (Record Descriptor Word):
- *    - Campo de 4 bytes Big-Endian antes de cada mensaje IPM
- *    - Contiene la longitud del payload del mensaje (sin incluir los 4 bytes del RDW)
- *    - EOF marcado con RDW = 0x00000000
- *    - Permite mensajes de longitud variable
- * 
- * 2. CAPA VBS (Variable Blocked Spanned):
- *    - Formato Variable Blocked Spanned
- *    - Los mensajes pueden exceder el limite de 1014 bytes de la red Mastercard
- *    - Mensajes grandes pueden "spannear" multiples bloques
- * 
- * 3. CAPA 1014-BLOCKING:
- *    - Bloques fisicos de 1014 bytes para transmision por red Mastercard
- *    - Estructura: [1012 bytes datos][2 bytes padding 0x40]
- *    - Padding con 0x40 (espacio EBCDIC) hasta completar bloque
- *    - Ultimo bloque puede ser parcial con padding
+ * 2. ARCHIVOS DE REPORTE (Reports):
+ *    - T007, T113, T121, T140, T150, T067, T068, T167, T168
+ *    - Estructura: EBCDIC plano sin RDW
+ *    - Usan metodos: encode() / decode()
  * 
  * CODIFICACION:
  * - EBCDIC Cp500 (IBM International EBCDIC)
- * - Todos los campos alfanumericos en EBCDIC
+ * - 1014-blocking: [1012 datos][2 padding 0x40]
  * - 0x40 = espacio en EBCDIC
  * 
- * MODOS DE OPERACION:
- * 
- * 1. DECODE (IPM binario EBCDIC -> archivo texto ASCII):
- *    - Lee archivo IPM con 1014-blocking
- *    - Auto-detecta y remueve 1014-blocking
- *    - Parsea RDW para extraer mensajes individuales
- *    - Convierte cada registro de EBCDIC a ASCII
- *    - Genera UN SOLO archivo de salida con un registro por linea
- *    - Formato de salida simple y legible
- * 
- * 2. ENCODE (archivo texto ASCII -> IPM binario EBCDIC):
- *    - Lee archivo de texto ASCII (una linea = un registro)
- *    - Convierte cada linea a EBCDIC Cp500
- *    - Construye estructura VBS con RDW de 4 bytes
- *    - Aplica 1014-blocking para transmision
- *    - Genera archivo IPM listo para envio
- * 
- * 3. RAW (conversion directa sin parseo RDW):
- *    - Conversion byte-a-byte EBCDIC <-> ASCII
- *    - NO parsea estructura RDW
- *    - NO aplica 1014-blocking
- *    - Util para archivos EBCDIC genericos o debugging
- *    - Mantiene estructura original del archivo
- * 
- * SALIDA SIMPLIFICADA (DECODE):
- * - Archivo unico con nombre especificado en --output
- * - Un registro por linea
- * - Formato ASCII legible
- * - Sin archivos adicionales
- * 
- * Referencias:
- * - GCMS Reference Manual: "Record Descriptor Word at the beginning of IPM messages"
- * - File Transfer Manual: "Variable Blocked Spanned (VBS) format"
- * - Layout 1014: Bloques de 1014 bytes (1012 datos + 2 padding)
- * 
  * @author Sistema de Integracion Mastercard
- * @version 2.1
- * @since 2024
+ * @version 3.0
+ * @since 2025
  */
 public class IpmConverter {
 
-    // Parametros del layout 1014 segun especificacion Mastercard
+    // Constantes del layout 1014 segun especificacion Mastercard
     private static final int BLOCK_SIZE = 1014;      // Tamano total del bloque fisico
     private static final int DATA_PER_BLOCK = 1012;  // Datos utiles por bloque (1014 - 2)
-    private static final byte PAD_40 = 0x40;         // Padding EBCDIC space (literal 0x40)
+    private static final byte PAD_40 = 0x40;         // Padding EBCDIC space
 
-    // Flag de debug para diagnostico detallado
+    // Flag de debug
     private static final boolean DEBUG = Boolean.getBoolean("ipm.debug");
+
+    /* ========================================================================
+     * MAIN - Punto de entrada
+     * ======================================================================== */
 
     public static void main(String[] args) {
         if (args.length == 0 || "help".equalsIgnoreCase(args[0])) {
             printHelp();
             return;
         }
+        
         String cmd = args[0].toLowerCase();
 
-        if ("decode".equals(cmd)) {
-            runDecode(args);
-        } else if ("encode".equals(cmd)) {
-            runEncode(args);
-        } else if ("raw".equals(cmd)) {
-            runRaw(args);
-        } else if ("t150".equals(cmd)) {
-            runT150Decode(args);
-        } else {
-            System.err.println("Comando no soportado: " + cmd);
-            printHelp();
-            System.exit(2);
-        }
-    }
-
-    /* ========================================================================
-     * MODO DECODE - Decodificacion de archivo IPM binario a texto ASCII
-     * ======================================================================== */
-
-    /**
-     * Ejecuta el proceso de decodificacion de un archivo IPM
-     * 
-     * PROCESO:
-     * 1. Lee archivo IPM binario completo
-     * 2. Auto-detecta presencia de 1014-blocking
-     * 3. Remueve 1014-blocking si existe
-     * 4. Parsea estructura VBS con RDW de 4 bytes
-     * 5. Extrae cada registro individual
-     * 6. Convierte de EBCDIC a ASCII
-     * 7. Genera UN SOLO archivo de salida:
-     *    - Ruta y nombre especificado en --output
-     *    - Un registro por linea
-     *    - Formato ASCII legible
-     * 
-     * FLAGS:
-     * --input <ruta>   : Archivo IPM a decodificar (requerido)
-     * --output <ruta>  : Archivo de salida (requerido)
-     * 
-     * SALIDA:
-     * Un unico archivo de texto con todos los registros, uno por linea.
-     * 
-     * @param args Argumentos de linea de comandos
-     */
-    private static void runDecode(String[] args) {
-        String inputPath = null;
-        String outputPath = null;
-
-        // Parseo de parametros
-        for (int i = 1; i < args.length; i++) {
-            String a = args[i];
-            if ("--input".equals(a) && i + 1 < args.length) {
-                inputPath = args[++i];
-            } else if ("--output".equals(a) && i + 1 < args.length) {
-                outputPath = args[++i];
+        try {
+            if ("encodeipm".equals(cmd)) {
+                runEncodeIpm(args);
+            } else if ("decodeipm".equals(cmd)) {
+                runDecodeIpm(args);
+            } else if ("encode".equals(cmd)) {
+                runEncode(args);
+            } else if ("decode".equals(cmd)) {
+                runDecode(args);
             } else {
-                System.err.println("Flag desconocida o valor faltante: " + a);
+                System.err.println("Comando no reconocido: " + cmd);
                 printHelp();
                 System.exit(2);
             }
-        }
-        
-        if (inputPath == null || outputPath == null) {
-            System.err.println("Faltan parametros --input y/o --output");
-            printHelp();
-            System.exit(2);
-        }
-
-        try {
-            if (DEBUG) {
-                System.out.println("==============================================");
-                System.out.println("MODO DEBUG ACTIVADO");
-                System.out.println("==============================================");
-            }
-
-            // Leer archivo completo en memoria
-            byte[] raw = readAllBytes(new File(inputPath));
-            System.out.println("Archivo entrada: " + inputPath);
-            System.out.println("Tamano         : " + raw.length + " bytes");
-
-            if (DEBUG) {
-                System.out.println("Primeros 32 bytes (hex): " + hexBytes(raw, 0, Math.min(32, raw.length)));
-            }
-
-            // Auto-deteccion de 1014-blocking
-            boolean isBlocked = decideBlockedImproved(raw);
-            System.out.println("1014-blocked   : " + isBlocked);
-            
-            if (DEBUG && isBlocked) {
-                System.out.println("DEBUG: Removiendo 1014-blocking...");
-            }
-
-            // Remover blocking si existe
-            byte[] vbs = isBlocked ? remove1014Blocking(raw) : raw;
-
-            if (DEBUG) {
-                System.out.println("DEBUG: Tamano VBS: " + vbs.length + " bytes");
-                System.out.println("DEBUG: Parseando registros RDW...");
-            }
-
-            // Parsear estructura VBS con RDW IPM (4 bytes BE)
-            List<byte[]> records = parseVbsRdwIpm(vbs);
-            System.out.println("Registros      : " + records.size());
-
-            // Preparar charset EBCDIC para conversion
-            Charset cs = pickCp500();
-            System.out.println("Encoding       : " + cs.displayName());
-
-            // Generar archivo de salida consolidado
-            System.out.println("\nGenerando archivo de salida...");
-            BufferedWriter writer = new BufferedWriter(
-                new OutputStreamWriter(new FileOutputStream(outputPath), "UTF-8"));
-            
-            try {
-                for (int i = 0; i < records.size(); i++) {
-                    byte[] rec = records.get(i);
-                    
-                    if (DEBUG && i < 3) {
-                        System.out.println("DEBUG: Record " + (i+1) + " size=" + rec.length + 
-                            " hex=" + hexBytes(rec, 0, Math.min(16, rec.length)));
-                    }
-                    
-                    // Convertir de EBCDIC a ASCII (conversión directa sin filtros)
-                    String asciiText = new String(rec, cs);
-                    
-                    // Escribir linea (un registro por linea)
-                    writer.write(asciiText);
-                    writer.newLine();
-                }
-            } finally {
-                writer.close();
-            }
-
-            System.out.println("\nDECODE completado exitosamente.");
-            System.out.println("Archivo salida: " + outputPath);
-            
         } catch (Exception e) {
-            System.err.println("Error en DECODE: " + e.getMessage());
-            e.printStackTrace();
+            System.err.println("ERROR: " + e.getMessage());
+            if (DEBUG) {
+                e.printStackTrace();
+            }
             System.exit(1);
         }
     }
 
     /* ========================================================================
-     * MODO ENCODE - Codificacion de texto ASCII a archivo IPM binario
+     * COMANDOS IPM - Para archivos con estructura RDW (R111, R119, T112, T120)
      * ======================================================================== */
 
     /**
-     * Ejecuta el proceso de codificacion de texto ASCII a formato IPM
+     * ENCODEIPM - Convierte archivo ASCII a formato IPM
      * 
-     * PROCESO:
-     * 1. Lee archivo ASCII de entrada (una linea por registro)
-     * 2. Para cada linea:
-     *    a. Convierte texto ASCII a EBCDIC Cp500
-     *    b. Construye registro VBS con RDW de 4 bytes (longitud en BE)
-     * 3. Agrega EOF (0x00000000) al final
-     * 4. Aplica 1014-blocking completo
-     * 5. Escribe archivo IPM binario listo para transmision
+     * Para: R111, R119, RSP1, RSP3
      * 
-     * FLAGS:
-     * --input <ruta>   : Archivo texto ASCII (requerido)
-     * --output <ruta>  : Archivo IPM de salida (requerido)
+     * Entrada: Archivo ASCII con un registro por linea
+     * Salida: Archivo IPM binario con RDW + VBS + 1014-blocking
      * 
-     * SALIDA:
-     * Archivo IPM binario en formato EBCDIC con:
-     * - Estructura VBS con RDW
-     * - 1014-blocking aplicado
-     * - EOF (0x00000000) al final
-     * - Listo para enviar a Mastercard
-     * 
-     * @param args Argumentos de linea de comandos
+     * Proceso:
+     * 1. Lee lineas ASCII
+     * 2. Convierte a EBCDIC Cp500
+     * 3. Construye RDW (4 bytes Big-Endian) por registro
+     * 4. Agrega EOF (0x00000000)
+     * 5. Aplica 1014-blocking
      */
-    private static void runEncode(String[] args) {
-        String inputPath = null;
-        String outputPath = null;
-
-        // Parseo de parametros
-        for (int i = 1; i < args.length; i++) {
-            String a = args[i];
-            if ("--input".equals(a) && i + 1 < args.length) {
-                inputPath = args[++i];
-            } else if ("--output".equals(a) && i + 1 < args.length) {
-                outputPath = args[++i];
-            } else {
-                System.err.println("Flag desconocida o valor faltante: " + a);
-                printHelp();
-                System.exit(2);
-            }
-        }
+    private static void runEncodeIpm(String[] args) throws Exception {
+        Params p = parseParams(args);
         
-        if (inputPath == null || outputPath == null) {
-            System.err.println("Faltan parametros --input y/o --output");
-            printHelp();
-            System.exit(2);
+        if (DEBUG) {
+            System.out.println("==============================================");
+            System.out.println("ENCODEIPM - ASCII to IPM");
+            System.out.println("==============================================");
         }
 
+        System.out.println("Archivo entrada: " + p.input);
+        
+        // PASO 1: Leer lineas ASCII
+        List<String> lines = readLinesAscii(new File(p.input));
+        System.out.println("Lineas leidas  : " + lines.size());
+
+        // PASO 2: Convertir a EBCDIC y construir registros
+        Charset ebcdic = pickCp500();
+        List<byte[]> records = new ArrayList<byte[]>();
+        
+        for (int i = 0; i < lines.size(); i++) {
+            String line = lines.get(i);
+            if (line.length() == 0) continue;
+            
+            byte[] rec = line.getBytes(ebcdic);
+            records.add(rec);
+            
+            if (DEBUG && i < 3) {
+                System.out.println("DEBUG: Line " + (i+1) + " -> " + rec.length + " bytes EBCDIC");
+            }
+        }
+
+        System.out.println("Registros      : " + records.size());
+
+        // PASO 3: Construir VBS con RDW
+        byte[] vbs = buildVbsWithRdw(records);
+
+        // PASO 4: Aplicar 1014-blocking
+        byte[] blocked = apply1014Blocking(vbs);
+
+        System.out.println("Tamano VBS     : " + vbs.length + " bytes");
+        System.out.println("Tamano blocked : " + blocked.length + " bytes");
+
+        // PASO 5: Escribir archivo
+        writeAllBytes(new File(p.output), blocked);
+
+        System.out.println("\nENCODEIPM completado exitosamente.");
+        System.out.println("Archivo salida: " + p.output);
+    }
+
+    /**
+     * DECODEIPM - Convierte archivo IPM a formato ASCII
+     * 
+     * Para: T112, T120
+     * 
+     * Entrada: Archivo IPM binario con RDW + VBS + 1014-blocking
+     * Salida: Archivo ASCII con un registro por linea
+     * 
+     * Proceso:
+     * 1. Lee archivo completo
+     * 2. Auto-detecta y remueve 1014-blocking
+     * 3. Parsea RDW para extraer registros
+     * 4. Convierte de EBCDIC a ASCII
+     * 5. Escribe un registro por linea
+     */
+    private static void runDecodeIpm(String[] args) throws Exception {
+        Params p = parseParams(args);
+        
+        if (DEBUG) {
+            System.out.println("==============================================");
+            System.out.println("DECODEIPM - IPM to ASCII");
+            System.out.println("==============================================");
+        }
+
+        // PASO 1: Leer archivo completo
+        byte[] raw = readAllBytes(new File(p.input));
+        System.out.println("Archivo entrada: " + p.input);
+        System.out.println("Tamano         : " + raw.length + " bytes");
+
+        if (DEBUG) {
+            System.out.println("Primeros 32 bytes: " + hexBytes(raw, 0, Math.min(32, raw.length)));
+        }
+
+        // PASO 2: Auto-detectar y remover 1014-blocking
+        boolean isBlocked = detect1014Blocking(raw);
+        System.out.println("1014-blocked   : " + isBlocked);
+        
+        byte[] vbs = isBlocked ? remove1014Blocking(raw) : raw;
+
+        // PASO 3: Parsear RDW y extraer registros
+        List<byte[]> records = parseVbsWithRdw(vbs);
+        System.out.println("Registros      : " + records.size());
+
+        // PASO 4: Convertir a ASCII
+        Charset ebcdic = pickCp500();
+        System.out.println("Encoding       : " + ebcdic.displayName());
+
+        BufferedWriter writer = new BufferedWriter(
+            new OutputStreamWriter(new FileOutputStream(p.output), "UTF-8"));
+        
         try {
-            if (DEBUG) {
-                System.out.println("==============================================");
-                System.out.println("MODO DEBUG ACTIVADO - ENCODE");
-                System.out.println("==============================================");
-            }
-
-            // Charset EBCDIC
-            Charset cs = pickCp500();
-            System.out.println("Archivo entrada: " + inputPath);
-            System.out.println("Encoding       : " + cs.displayName());
-
-            // Leer archivo linea por linea y construir VBS
-            ByteArrayOutputStream vbsOut = new ByteArrayOutputStream();
-            BufferedReader reader = new BufferedReader(
-                new InputStreamReader(new FileInputStream(inputPath), "UTF-8"));
-            
-            int recordCount = 0;
-            String line;
-            
-            try {
-                while ((line = reader.readLine()) != null) {
-                    recordCount++;
-                    
-                    // Convertir linea ASCII a EBCDIC
-                    byte[] ebcdicData = line.getBytes(cs);
-                    int len = ebcdicData.length;
-                    
-                    if (DEBUG && recordCount <= 3) {
-                        System.out.println("DEBUG: Record " + recordCount + 
-                            " ASCII_len=" + line.length() + 
-                            " EBCDIC_len=" + len);
-                        System.out.println("DEBUG: Primera linea ASCII: " + 
-                            (line.length() > 60 ? line.substring(0, 60) + "..." : line));
-                        System.out.println("DEBUG: EBCDIC hex: " + 
-                            hexBytes(ebcdicData, 0, Math.min(32, ebcdicData.length)));
-                    }
-                    
-                    // Construir RDW: 4 bytes Big-Endian con longitud del payload
-                    byte[] rdw = new byte[4];
-                    rdw[0] = (byte) ((len >> 24) & 0xFF);
-                    rdw[1] = (byte) ((len >> 16) & 0xFF);
-                    rdw[2] = (byte) ((len >> 8) & 0xFF);
-                    rdw[3] = (byte) (len & 0xFF);
-                    
-                    if (DEBUG && recordCount <= 3) {
-                        System.out.println("DEBUG: RDW=" + hexBytes(rdw, 0, 4) + 
-                            " (len=" + len + ")");
-                    }
-                    
-                    // Escribir RDW + payload en VBS stream
-                    vbsOut.write(rdw);
-                    vbsOut.write(ebcdicData);
+            for (int i = 0; i < records.size(); i++) {
+                byte[] rec = records.get(i);
+                
+                if (DEBUG && i < 3) {
+                    System.out.println("DEBUG: Record " + (i+1) + " = " + rec.length + " bytes");
                 }
-            } finally {
-                reader.close();
+                
+                // Conversion directa EBCDIC -> ASCII
+                String asciiText = new String(rec, ebcdic);
+                writer.write(asciiText);
+                writer.newLine();
             }
-
-            // Agregar EOF: 0x00000000
-            vbsOut.write(new byte[]{0, 0, 0, 0});
-            
-            System.out.println("Registros      : " + recordCount);
-            
-            byte[] vbs = vbsOut.toByteArray();
-            if (DEBUG) {
-                System.out.println("DEBUG: VBS total size: " + vbs.length + " bytes");
-            }
-
-            // Aplicar 1014-blocking
-            if (DEBUG) {
-                System.out.println("DEBUG: Aplicando 1014-blocking...");
-            }
-            byte[] blocked = apply1014Blocking(vbs);
-
-            System.out.println("Tamano VBS     : " + vbs.length + " bytes");
-            System.out.println("Tamano blocked : " + blocked.length + " bytes");
-
-            // Escribir archivo de salida
-            FileOutputStream fos = new FileOutputStream(outputPath);
-            try {
-                fos.write(blocked);
-            } finally {
-                fos.close();
-            }
-
-            System.out.println("\nENCODE completado exitosamente.");
-            System.out.println("Archivo salida: " + outputPath);
-            
-        } catch (Exception e) {
-            System.err.println("Error en ENCODE: " + e.getMessage());
-            e.printStackTrace();
-            System.exit(1);
+        } finally {
+            writer.close();
         }
+
+        System.out.println("\nDECODEIPM completado exitosamente.");
+        System.out.println("Archivo salida: " + p.output);
     }
 
     /* ========================================================================
-     * MODO T150 - Decodificacion de archivos de reporte T150
+     * COMANDOS GENERICOS - Para archivos EBCDIC planos (T007, T113, T140, T150)
      * ======================================================================== */
 
     /**
-     * Decodifica archivos T150 de Mastercard (reportes de clearing cycle)
+     * ENCODE - Convierte archivo ASCII a EBCDIC plano
      * 
-     * Los archivos T150 NO usan estructura RDW/VBS como los IPM.
-     * Son archivos EBCDIC con registros de longitud fija o delimitados.
+     * Para: Archivos de reporte y otros sin estructura RDW
      * 
-     * PROCESO:
-     * 1. Lee archivo EBCDIC completo
-     * 2. Detecta y remueve 1014-blocking si existe
+     * Entrada: Archivo ASCII
+     * Salida: Archivo EBCDIC con 1014-blocking opcional
+     * 
+     * Proceso:
+     * 1. Lee archivo ASCII completo
+     * 2. Convierte a EBCDIC Cp500
+     * 3. Aplica 1014-blocking
+     */
+    private static void runEncode(String[] args) throws Exception {
+        Params p = parseParams(args);
+        
+        if (DEBUG) {
+            System.out.println("==============================================");
+            System.out.println("ENCODE - ASCII to EBCDIC");
+            System.out.println("==============================================");
+        }
+
+        System.out.println("Archivo entrada: " + p.input);
+
+        // PASO 1: Leer archivo ASCII
+        byte[] asciiData = readAllBytes(new File(p.input));
+        System.out.println("Tamano ASCII   : " + asciiData.length + " bytes");
+
+        // PASO 2: Convertir a EBCDIC
+        Charset ebcdic = pickCp500();
+        String text = new String(asciiData, "UTF-8");
+        byte[] ebcdicData = text.getBytes(ebcdic);
+        
+        System.out.println("Tamano EBCDIC  : " + ebcdicData.length + " bytes");
+
+        // PASO 3: Aplicar 1014-blocking
+        byte[] blocked = apply1014Blocking(ebcdicData);
+        System.out.println("Tamano blocked : " + blocked.length + " bytes");
+
+        // PASO 4: Escribir archivo
+        writeAllBytes(new File(p.output), blocked);
+
+        System.out.println("\nENCODE completado exitosamente.");
+        System.out.println("Archivo salida: " + p.output);
+    }
+
+    /**
+     * DECODE - Convierte archivo EBCDIC plano a ASCII
+     * 
+     * Para: T007, T113, T121, T140, T150, T067, T068, T167, T168
+     * 
+     * Entrada: Archivo EBCDIC con/sin 1014-blocking
+     * Salida: Archivo ASCII
+     * 
+     * Proceso:
+     * 1. Lee archivo completo
+     * 2. Auto-detecta y remueve 1014-blocking
      * 3. Convierte directamente de EBCDIC a ASCII
-     * 4. NO parsea RDW (no tienen)
-     * 
-     * @param args Argumentos de linea de comandos
      */
-    private static void runT150Decode(String[] args) {
-        String inputPath = null;
-        String outputPath = null;
-
-        // Parseo de parametros
-        for (int i = 1; i < args.length; i++) {
-            String a = args[i];
-            if ("--input".equals(a) && i + 1 < args.length) {
-                inputPath = args[++i];
-            } else if ("--output".equals(a) && i + 1 < args.length) {
-                outputPath = args[++i];
-            } else {
-                System.err.println("Flag desconocida o valor faltante: " + a);
-                printHelp();
-                System.exit(2);
-            }
-        }
+    private static void runDecode(String[] args) throws Exception {
+        Params p = parseParams(args);
         
-        if (inputPath == null || outputPath == null) {
-            System.err.println("Faltan parametros --input y/o --output");
-            printHelp();
-            System.exit(2);
+        if (DEBUG) {
+            System.out.println("==============================================");
+            System.out.println("DECODE - EBCDIC to ASCII");
+            System.out.println("==============================================");
         }
 
+        // PASO 1: Leer archivo completo
+        byte[] raw = readAllBytes(new File(p.input));
+        System.out.println("Archivo entrada: " + p.input);
+        System.out.println("Tamano         : " + raw.length + " bytes");
+
+        if (DEBUG) {
+            System.out.println("Primeros 32 bytes: " + hexBytes(raw, 0, Math.min(32, raw.length)));
+        }
+
+        // PASO 2: Auto-detectar y remover 1014-blocking
+        boolean isBlocked = detect1014Blocking(raw);
+        System.out.println("1014-blocked   : " + isBlocked);
+        
+        byte[] ebcdicData = isBlocked ? remove1014Blocking(raw) : raw;
+
+        // PASO 3: Convertir a ASCII
+        Charset ebcdic = pickCp500();
+        System.out.println("Encoding       : " + ebcdic.displayName());
+        
+        String asciiText = new String(ebcdicData, ebcdic);
+
+        // PASO 4: Escribir archivo
+        FileOutputStream fos = new FileOutputStream(p.output);
         try {
-            if (DEBUG) {
-                System.out.println("==============================================");
-                System.out.println("MODO T150 - Archivo de Reporte Mastercard");
-                System.out.println("==============================================");
-            }
-
-            // Leer archivo completo
-            byte[] raw = readAllBytes(new File(inputPath));
-            System.out.println("Archivo entrada: " + inputPath);
-            System.out.println("Tamano         : " + raw.length + " bytes");
-
-            if (DEBUG) {
-                System.out.println("Primeros 32 bytes (hex): " + hexBytes(raw, 0, Math.min(32, raw.length)));
-            }
-
-            // Auto-detectar 1014-blocking
-            boolean isBlocked = decideBlockedImproved(raw);
-            System.out.println("1014-blocked   : " + isBlocked);
-
-            // Remover blocking si existe
-            byte[] ebcdicData = isBlocked ? remove1014Blocking(raw) : raw;
-
-            if (DEBUG) {
-                System.out.println("DEBUG: Datos EBCDIC sin blocking: " + ebcdicData.length + " bytes");
-            }
-
-            // Convertir de EBCDIC a ASCII directamente (sin parsear RDW)
-            Charset cs = pickCp500();
-            System.out.println("Encoding       : " + cs.displayName());
-            
-            String asciiText = new String(ebcdicData, cs);
-
-            // Escribir archivo de salida
-            FileOutputStream fos = new FileOutputStream(outputPath);
-            try {
-                fos.write(asciiText.getBytes("UTF-8"));
-            } finally {
-                fos.close();
-            }
-
-            System.out.println("\nT150 DECODE completado exitosamente.");
-            System.out.println("Archivo salida: " + outputPath);
-            System.out.println("Formato: ASCII (conversión directa sin RDW)");
-            
-        } catch (Exception e) {
-            System.err.println("Error en T150 DECODE: " + e.getMessage());
-            e.printStackTrace();
-            System.exit(1);
+            fos.write(asciiText.getBytes("UTF-8"));
+        } finally {
+            fos.close();
         }
+
+        System.out.println("\nDECODE completado exitosamente.");
+        System.out.println("Archivo salida: " + p.output);
     }
 
     /* ========================================================================
-     * MODO RAW - Conversion directa EBCDIC <-> ASCII sin parseo RDW
+     * ESTRUCTURA RDW - Construccion y parseo
      * ======================================================================== */
 
     /**
-     * Ejecuta conversion RAW entre EBCDIC y ASCII
+     * Construye estructura VBS con RDW de 4 bytes Big-Endian
      * 
-     * Conversion byte-a-byte sin parseo de estructura VBS ni RDW.
-     * Util para archivos EBCDIC genericos o debugging.
-     * NO aplica ni remueve 1014-blocking.
+     * Formato por registro:
+     * [4 bytes RDW Big-Endian][N bytes payload]
      * 
-     * FLAGS:
-     * --input <ruta>        : Archivo de entrada (requerido)
-     * --output <ruta>       : Archivo de salida (requerido)
-     * --direction <e2a|a2e> : Direccion de conversion (requerido)
-     *   e2a = EBCDIC to ASCII
-     *   a2e = ASCII to EBCDIC
-     * 
-     * @param args Argumentos de linea de comandos
+     * Al final agrega EOF:
+     * [0x00 0x00 0x00 0x00]
      */
-    private static void runRaw(String[] args) {
-        String inputPath = null;
-        String outputPath = null;
-        String direction = null;
-
-        // Parseo de parametros
-        for (int i = 1; i < args.length; i++) {
-            String a = args[i];
-            if ("--input".equals(a) && i + 1 < args.length) {
-                inputPath = args[++i];
-            } else if ("--output".equals(a) && i + 1 < args.length) {
-                outputPath = args[++i];
-            } else if ("--direction".equals(a) && i + 1 < args.length) {
-                direction = args[++i].toLowerCase();
-            } else {
-                System.err.println("Flag desconocida o valor faltante: " + a);
-                printHelp();
-                System.exit(2);
-            }
-        }
+    private static byte[] buildVbsWithRdw(List<byte[]> records) throws IOException {
+        ByteArrayOutputStream vbs = new ByteArrayOutputStream();
         
-        if (inputPath == null || outputPath == null || direction == null) {
-            System.err.println("Faltan parametros --input, --output y/o --direction");
-            printHelp();
-            System.exit(2);
-        }
-        
-        if (!"e2a".equals(direction) && !"a2e".equals(direction)) {
-            System.err.println("--direction debe ser 'e2a' o 'a2e'");
-            printHelp();
-            System.exit(2);
-        }
-
-        try {
-            Charset cs = pickCp500();
-            System.out.println("Archivo entrada: " + inputPath);
-            System.out.println("Direccion      : " + direction);
-            System.out.println("Encoding       : " + cs.displayName());
-
-            byte[] raw = readAllBytes(new File(inputPath));
-            System.out.println("Tamano entrada : " + raw.length + " bytes");
-
-            byte[] result;
-            if ("e2a".equals(direction)) {
-                // EBCDIC -> ASCII (conversión directa)
-                String ebcdicText = new String(raw, cs);
-                result = ebcdicText.getBytes("UTF-8");
-            } else {
-                // ASCII -> EBCDIC
-                String asciiText = new String(raw, "UTF-8");
-                result = asciiText.getBytes(cs);
-            }
-
-            System.out.println("Tamano salida  : " + result.length + " bytes");
-
-            // Escribir resultado
-            FileOutputStream fos = new FileOutputStream(outputPath);
-            try {
-                fos.write(result);
-            } finally {
-                fos.close();
-            }
-
-            System.out.println("\nRAW conversion completada exitosamente.");
-            System.out.println("Archivo salida: " + outputPath);
+        for (int i = 0; i < records.size(); i++) {
+            byte[] rec = records.get(i);
+            int len = rec.length;
             
-        } catch (Exception e) {
-            System.err.println("Error en RAW: " + e.getMessage());
-            e.printStackTrace();
-            System.exit(1);
+            if (DEBUG && i < 3) {
+                System.out.println("DEBUG: RDW para record " + (i+1) + " = " + len);
+            }
+            
+            // Escribir RDW (4 bytes Big-Endian)
+            vbs.write((len >>> 24) & 0xFF);
+            vbs.write((len >>> 16) & 0xFF);
+            vbs.write((len >>> 8)  & 0xFF);
+            vbs.write(len & 0xFF);
+            
+            // Escribir payload
+            vbs.write(rec);
         }
+        
+        // Escribir EOF
+        if (DEBUG) {
+            System.out.println("DEBUG: Escribiendo EOF");
+        }
+        vbs.write(0);
+        vbs.write(0);
+        vbs.write(0);
+        vbs.write(0);
+        
+        return vbs.toByteArray();
     }
 
-    /* ========================================================================
-     * PARSEO VBS - Extraccion de registros con RDW
-     * ======================================================================== */
-
     /**
-     * Parsea datos VBS con RDW de 4 bytes Big-Endian (formato IPM)
+     * Parsea estructura VBS con RDW de 4 bytes Big-Endian
      * 
-     * Formato RDW IPM:
-     * - 4 bytes Big-Endian conteniendo longitud del payload
-     * - Payload de N bytes
-     * - EOF marcado con 0x00000000
-     * 
-     * @param vbs Datos VBS sin 1014-blocking
-     * @return Lista de registros extraidos
-     * @throws IOException Si el formato es invalido
+     * Lee registros hasta encontrar EOF (0x00000000)
      */
-    private static List<byte[]> parseVbsRdwIpm(byte[] vbs) throws IOException {
+    private static List<byte[]> parseVbsWithRdw(byte[] vbs) throws IOException {
         List<byte[]> records = new ArrayList<byte[]>();
         int pos = 0;
         int recordNum = 0;
 
         while (pos + 4 <= vbs.length) {
-            // Leer RDW de 4 bytes Big-Endian
-            int rdw = ((vbs[pos] & 0xFF) << 24) |
+            // Leer RDW (4 bytes Big-Endian)
+            int len = ((vbs[pos] & 0xFF) << 24) |
                       ((vbs[pos + 1] & 0xFF) << 16) |
                       ((vbs[pos + 2] & 0xFF) << 8) |
                       (vbs[pos + 3] & 0xFF);
             
             if (DEBUG && recordNum < 3) {
-                System.out.println("DEBUG: Pos " + pos + " RDW=" + rdw + 
-                    " (hex: " + String.format("%08X", rdw) + ")");
+                System.out.println("DEBUG: Pos " + pos + " RDW=" + len);
             }
 
-            // Detectar EOF (0x00000000)
-            if (rdw == 0) {
+            // Detectar EOF
+            if (len == 0) {
                 if (DEBUG) {
-                    System.out.println("DEBUG: EOF detectado en pos " + pos);
+                    System.out.println("DEBUG: EOF en pos " + pos);
                 }
                 break;
             }
 
-            // Validar longitud razonable
-            if (rdw < 0 || rdw > 100000) {
-                throw new IOException("RDW invalido en pos " + pos + ": " + rdw);
+            // Validar longitud
+            if (len < 0 || len > 100000) {
+                throw new IOException("RDW invalido en pos " + pos + ": " + len);
             }
 
             pos += 4;
             
             // Extraer payload
-            if (pos + rdw > vbs.length) {
-                throw new IOException("Payload truncado en pos " + pos + 
-                    ", necesita " + rdw + " bytes pero solo quedan " + 
-                    (vbs.length - pos));
+            if (pos + len > vbs.length) {
+                throw new IOException("Payload truncado en pos " + pos);
             }
             
-            byte[] payload = new byte[rdw];
-            System.arraycopy(vbs, pos, payload, 0, rdw);
+            byte[] payload = new byte[len];
+            System.arraycopy(vbs, pos, payload, 0, len);
             records.add(payload);
             
-            pos += rdw;
+            pos += len;
             recordNum++;
         }
 
@@ -635,40 +417,28 @@ public class IpmConverter {
     }
 
     /* ========================================================================
-     * AUTO-DETECCION Y MANEJO DE 1014-BLOCKING
+     * 1014-BLOCKING - Deteccion, aplicacion y remocion
      * ======================================================================== */
 
     /**
-     * Auto-detecta si los datos tienen 1014-blocking aplicado
+     * Detecta si el archivo tiene 1014-blocking aplicado
      * 
-     * Criterios de deteccion:
-     * 1. Tamano divisible entre 1014
-     * 2. Mayoria de bloques terminan en 0x40 0x40 (padding EBCDIC)
-     * 3. Padding extenso despues de EOF si existe
-     * 
-     * @param raw Datos a analizar
-     * @return true si tiene 1014-blocking, false caso contrario
+     * Criterios:
+     * 1. Tamano multiple de 1014
+     * 2. Bloques terminan en 0x40 0x40 (>60%)
      */
-    private static boolean decideBlockedImproved(byte[] raw) {
-        if (raw.length == 0) {
-            return false;
-        }
-
-        // Si no es multiplo de 1014, definitivamente no esta blocked
+    private static boolean detect1014Blocking(byte[] raw) {
         if (raw.length % BLOCK_SIZE != 0) {
             if (DEBUG) {
-                System.out.println("DEBUG: Longitud " + raw.length + 
-                    " no es multiplo de 1014 -> NO BLOCKED");
+                System.out.println("DEBUG: No es multiplo de 1014 -> NO blocked");
             }
             return false;
         }
-
+        
         int blocks = raw.length / BLOCK_SIZE;
-        if (DEBUG) {
-            System.out.println("DEBUG: Analizando " + blocks + " bloques de 1014 bytes");
-        }
+        if (blocks == 0) return false;
 
-        // Contar bloques que terminan en 0x40 0x40
+        // Contar bloques con padding
         int hits = 0;
         for (int b = 0; b < blocks; b++) {
             int end = (b + 1) * BLOCK_SIZE;
@@ -678,69 +448,24 @@ public class IpmConverter {
         }
         
         if (DEBUG) {
-            System.out.println("DEBUG: Bloques con padding 0x40 0x40: " + hits + "/" + blocks);
+            System.out.println("DEBUG: Bloques con 0x40 0x40: " + hits + "/" + blocks);
         }
 
-        // Si hay multiples bloques: criterio de mayoria
-        if (blocks > 1) {
-            boolean result = (hits * 100 / blocks) >= 60;
-            if (DEBUG) {
-                System.out.println("DEBUG: Porcentaje: " + (hits * 100 / blocks) + "% -> " + 
-                    (result ? "BLOCKED" : "NO BLOCKED"));
-            }
-            return result;
-        }
-
-        // Caso especial: un solo bloque
-        if (hits == 1) {
-            if (DEBUG) {
-                System.out.println("DEBUG: Un bloque con padding -> BLOCKED");
-            }
-            return true;
+        // Criterio: >60% de bloques con padding
+        boolean result = (hits * 100 / blocks) >= 60;
+        
+        if (DEBUG) {
+            System.out.println("DEBUG: Porcentaje: " + (hits * 100 / blocks) + "% -> " + 
+                (result ? "BLOCKED" : "NO BLOCKED"));
         }
         
-        // Buscar EOF y analizar padding posterior
-        int eof = findRdwEof(raw);
-        if (eof >= 0) {
-            int padCount = 0;
-            int rem = raw.length - eof;
-            for (int p = eof; p < raw.length; p++) {
-                if (raw[p] == PAD_40) {
-                    padCount++;
-                }
-            }
-            boolean result = rem > 0 && (padCount * 100 / rem) >= 80;
-            if (DEBUG) {
-                System.out.println("DEBUG: EOF en pos " + (eof-4) + ", padding despues: " + 
-                    padCount + "/" + rem + " -> " + (result ? "BLOCKED" : "NO BLOCKED"));
-            }
-            return result;
-        }
-        
-        return false;
-    }
-
-    /**
-     * Busca el EOF (0x00000000) en los datos
-     * 
-     * @param a Datos donde buscar EOF
-     * @return Posicion despues del EOF, o -1 si no se encuentra
-     */
-    private static int findRdwEof(byte[] a) {
-        for (int i = 0; i + 3 < a.length; i++) {
-            if (a[i] == 0 && a[i+1] == 0 && a[i+2] == 0 && a[i+3] == 0) {
-                return i + 4;
-            }
-        }
-        return -1;
+        return result;
     }
 
     /**
      * Remueve 1014-blocking de los datos
      * 
-     * @param raw Datos con 1014-blocking
-     * @return Datos sin blocking (solo VBS puro)
-     * @throws IOException Si ocurre error de procesamiento
+     * Extrae 1012 bytes de cada bloque de 1014
      */
     private static byte[] remove1014Blocking(byte[] raw) throws IOException {
         ByteArrayOutputStream out = new ByteArrayOutputStream(raw.length);
@@ -751,21 +476,21 @@ public class IpmConverter {
             int remaining = raw.length - pos;
             
             if (remaining >= BLOCK_SIZE) {
-                // Bloque completo: tomar 1012 bytes
+                // Bloque completo: extraer 1012 bytes
                 out.write(raw, pos, DATA_PER_BLOCK);
                 pos += BLOCK_SIZE;
                 blockNum++;
                 
                 if (DEBUG && blockNum <= 3) {
-                    System.out.println("DEBUG: Bloque " + blockNum + " procesado, extraidos 1012 bytes");
+                    System.out.println("DEBUG: Bloque " + blockNum + " -> 1012 bytes extraidos");
                 }
             } else {
-                // Bloque parcial al final
-                int take = remaining < DATA_PER_BLOCK ? remaining : DATA_PER_BLOCK;
+                // Bloque parcial final
+                int take = Math.min(remaining, DATA_PER_BLOCK);
                 if (take > 0) {
                     out.write(raw, pos, take);
                     if (DEBUG) {
-                        System.out.println("DEBUG: Bloque final parcial, extraidos " + take + " bytes");
+                        System.out.println("DEBUG: Bloque final -> " + take + " bytes");
                     }
                 }
                 pos += remaining;
@@ -776,26 +501,26 @@ public class IpmConverter {
     }
 
     /**
-     * Aplica 1014-blocking a los datos VBS
+     * Aplica 1014-blocking a los datos
      * 
-     * @param vbs Datos VBS sin blocking
-     * @return Datos con 1014-blocking aplicado
-     * @throws IOException Si ocurre error de procesamiento
+     * Estructura por bloque:
+     * [1012 bytes datos][2 bytes padding 0x40]
+     * 
+     * TODOS LOS BLOQUES terminan con 0x40 0x40 (sin excepciones)
      */
-    private static byte[] apply1014Blocking(byte[] vbs) throws IOException {
+    private static byte[] apply1014Blocking(byte[] data) throws IOException {
         ByteArrayOutputStream out = new ByteArrayOutputStream(
-            vbs.length + (vbs.length / DATA_PER_BLOCK + 1) * 2);
+            data.length + (data.length / DATA_PER_BLOCK + 1) * 2);
         
         int pos = 0;
         int blockNum = 0;
         
-        while (pos < vbs.length) {
-            int remaining = vbs.length - pos;
-            int take = remaining < DATA_PER_BLOCK ? remaining : DATA_PER_BLOCK;
-            boolean isLastBlock = (pos + take >= vbs.length);
+        while (pos < data.length) {
+            int remaining = data.length - pos;
+            int take = Math.min(remaining, DATA_PER_BLOCK);
 
             // Escribir datos disponibles
-            out.write(vbs, pos, take);
+            out.write(data, pos, take);
             pos += take;
             blockNum++;
 
@@ -805,39 +530,29 @@ public class IpmConverter {
                     out.write(PAD_40);
                 }
                 if (DEBUG) {
-                    System.out.println("DEBUG: Bloque " + blockNum + " con padding: " + 
-                        (DATA_PER_BLOCK - take) + " bytes");
+                    System.out.println("DEBUG: Bloque " + blockNum + 
+                        " con padding: " + (DATA_PER_BLOCK - take) + " bytes");
                 }
             }
             
-            // Trailer del bloque: 0x00 0x00 para último bloque, 0x40 0x40 para los demás
-            if (isLastBlock) {
-                out.write(0x00);
-                out.write(0x00);
-                if (DEBUG) {
-                    System.out.println("DEBUG: Último bloque - trailer: 00 00");
-                }
-            } else {
-                out.write(PAD_40);
-                out.write(PAD_40);
-            }
+            // Trailer del bloque (SIEMPRE 2 bytes 0x40)
+            out.write(PAD_40);
+            out.write(PAD_40);
         }
         
         if (DEBUG) {
-            System.out.println("DEBUG: Total bloques 1014 generados: " + blockNum);
+            System.out.println("DEBUG: Total bloques generados: " + blockNum);
         }
         
         return out.toByteArray();
     }
 
     /* ========================================================================
-     * UTILIDADES DE TEXTO Y CHARSET
+     * UTILIDADES - Charset, I/O, parsing
      * ======================================================================== */
 
     /**
      * Obtiene charset EBCDIC Cp500
-     * 
-     * @return Charset EBCDIC Cp500
      */
     private static Charset pickCp500() {
         try {
@@ -846,63 +561,13 @@ public class IpmConverter {
             try {
                 return Charset.forName("IBM500");
             } catch (Exception ex) {
-                return Charset.forName("Cp500");
+                throw new RuntimeException("EBCDIC Cp500 charset no disponible");
             }
         }
     }
-
-    /**
-     * Convierte string a ASCII imprimible
-     * 
-     * Reemplaza caracteres no imprimibles con '.'
-     * Mantiene CR, LF, TAB y caracteres ASCII 32-126.
-     * 
-     * @param s String a convertir
-     * @return String con solo caracteres imprimibles
-     */
-    private static String toAsciiPrintable(String s) {
-        if (s == null) {
-            return "";
-        }
-        
-        StringBuffer sb = new StringBuffer(s.length());
-        for (int i = 0; i < s.length(); i++) {
-            char c = s.charAt(i);
-            if ((c >= 32 && c <= 126) || c == '\r' || c == '\n' || c == '\t') {
-                sb.append(c);
-            } else {
-                sb.append('.');
-            }
-        }
-        return sb.toString();
-    }
-
-    /**
-     * Convierte bytes a string hexadecimal para debug
-     * 
-     * @param data Array de bytes
-     * @param offset Posicion inicial
-     * @param length Numero de bytes a convertir
-     * @return String hexadecimal
-     */
-    private static String hexBytes(byte[] data, int offset, int length) {
-        StringBuilder sb = new StringBuilder();
-        for (int i = offset; i < offset + length && i < data.length; i++) {
-            sb.append(String.format("%02X ", data[i] & 0xFF));
-        }
-        return sb.toString().trim();
-    }
-
-    /* ========================================================================
-     * UTILIDADES I/O
-     * ======================================================================== */
 
     /**
      * Lee archivo completo en memoria
-     * 
-     * @param f Archivo a leer
-     * @return Contenido del archivo como array de bytes
-     * @throws IOException Si ocurre error de lectura
      */
     private static byte[] readAllBytes(File f) throws IOException {
         ByteArrayOutputStream baos = new ByteArrayOutputStream((int) f.length());
@@ -919,82 +584,145 @@ public class IpmConverter {
         return baos.toByteArray();
     }
 
-    /* ========================================================================
-     * AYUDA Y DOCUMENTACION
-     * ======================================================================== */
+    /**
+     * Escribe bytes a archivo
+     */
+    private static void writeAllBytes(File f, byte[] data) throws IOException {
+        FileOutputStream fos = new FileOutputStream(f);
+        try {
+            fos.write(data);
+        } finally {
+            fos.close();
+        }
+    }
 
     /**
-     * Muestra ayuda completa del programa
+     * Lee archivo de texto linea por linea
      */
+    private static List<String> readLinesAscii(File f) throws IOException {
+        List<String> lines = new ArrayList<String>();
+        BufferedReader reader = new BufferedReader(
+            new InputStreamReader(new FileInputStream(f), "UTF-8"));
+        try {
+            String line;
+            while ((line = reader.readLine()) != null) {
+                lines.add(line);
+            }
+        } finally {
+            reader.close();
+        }
+        return lines;
+    }
+
+    /**
+     * Convierte bytes a hex para debug
+     */
+    private static String hexBytes(byte[] data, int offset, int length) {
+        StringBuilder sb = new StringBuilder();
+        for (int i = offset; i < offset + length && i < data.length; i++) {
+            sb.append(String.format("%02X ", data[i] & 0xFF));
+        }
+        return sb.toString().trim();
+    }
+
+    /**
+     * Parsea parametros de linea de comandos
+     */
+    private static Params parseParams(String[] args) {
+        Params p = new Params();
+        
+        for (int i = 1; i < args.length; i++) {
+            String arg = args[i];
+            if ("--input".equals(arg) && i + 1 < args.length) {
+                p.input = args[++i];
+            } else if ("--output".equals(arg) && i + 1 < args.length) {
+                p.output = args[++i];
+            } else {
+                throw new IllegalArgumentException("Flag desconocida: " + arg);
+            }
+        }
+        
+        if (p.input == null || p.output == null) {
+            throw new IllegalArgumentException("Faltan parametros --input y/o --output");
+        }
+        
+        return p;
+    }
+
+    /**
+     * Clase para parametros
+     */
+    private static class Params {
+        String input;
+        String output;
+    }
+
+    /* ========================================================================
+     * AYUDA
+     * ======================================================================== */
+
     private static void printHelp() {
         System.out.println("=================================================================");
-        System.out.println("IpmConverter - Conversor de Archivos IPM Mastercard v2.1");
+        System.out.println("IpmConverter v3.0 - Conversor Mastercard EBCDIC <-> ASCII");
         System.out.println("=================================================================");
         System.out.println();
-        System.out.println("FORMATO IPM:");
-        System.out.println("  - EBCDIC Cp500 (IBM International EBCDIC)");
-        System.out.println("  - RDW de 4 bytes Big-Endian por mensaje");
-        System.out.println("  - 1014-blocking (1012 datos + 2 padding 0x40)");
-        System.out.println("  - EOF marcado con 0x00000000");
+        System.out.println("COMANDOS:");
         System.out.println();
-        System.out.println("MODOS:");
+        System.out.println("1. ENCODEIPM - Codificar ASCII a IPM (con RDW)");
+        System.out.println("   java IpmConverter encodeipm --input <txt> --output <ipm>");
         System.out.println();
-        System.out.println("1. DECODE - Decodificar IPM binario a texto ASCII");
-        System.out.println("   java IpmConverter decode --input <ipm_file> --output <txt_file>");
-        System.out.println();
-        System.out.println("   Genera UN archivo de salida con:");
-        System.out.println("   - Un registro por linea");
-        System.out.println("   - Formato ASCII legible");
-        System.out.println("   - Auto-deteccion y remocion de 1014-blocking");
-        System.out.println();
-        System.out.println("2. ENCODE - Codificar texto ASCII a IPM binario");
-        System.out.println("   java IpmConverter encode --input <txt_file> --output <ipm_file>");
-        System.out.println();
-        System.out.println("   Lee archivo ASCII donde:");
-        System.out.println("   - Una linea = un registro IPM");
-        System.out.println("   - Genera estructura VBS con RDW");
-        System.out.println("   - Aplica 1014-blocking completo");
+        System.out.println("   Para: R111, R119, RSP1, RSP3");
+        System.out.println("   - Lee archivo ASCII (un registro por linea)");
+        System.out.println("   - Construye RDW de 4 bytes por registro");
         System.out.println("   - Agrega EOF (0x00000000)");
+        System.out.println("   - Aplica 1014-blocking");
         System.out.println();
-        System.out.println("3. T150 - Decodificar archivos de reporte T150 (sin RDW)");
-        System.out.println("   java IpmConverter t150 --input <t150_file> --output <txt_file>");
+        System.out.println("2. DECODEIPM - Decodificar IPM a ASCII (con RDW)");
+        System.out.println("   java IpmConverter decodeipm --input <ipm> --output <txt>");
         System.out.println();
-        System.out.println("   Para archivos T150 de Mastercard:");
-        System.out.println("   - Clearing Cycle Acknowledgement/Notification Reports");
-        System.out.println("   - NO usan estructura RDW/VBS");
-        System.out.println("   - Conversion directa EBCDIC a ASCII");
+        System.out.println("   Para: T112, T120");
+        System.out.println("   - Auto-detecta y remueve 1014-blocking");
+        System.out.println("   - Parsea RDW para extraer registros");
+        System.out.println("   - Convierte EBCDIC a ASCII");
+        System.out.println("   - Genera un registro por linea");
         System.out.println();
-        System.out.println("4. RAW - Conversion directa EBCDIC <-> ASCII sin RDW");
-        System.out.println("   java IpmConverter raw --input <file> --output <file>");
-        System.out.println("                         --direction <e2a|a2e>");
+        System.out.println("3. ENCODE - Codificar ASCII a EBCDIC plano (sin RDW)");
+        System.out.println("   java IpmConverter encode --input <txt> --output <ebc>");
         System.out.println();
-        System.out.println("   Conversion byte-a-byte:");
-        System.out.println("   - e2a: EBCDIC to ASCII");
-        System.out.println("   - a2e: ASCII to EBCDIC");
-        System.out.println("   - NO parsea RDW ni aplica blocking");
+        System.out.println("   Para: Archivos de reporte");
+        System.out.println("   - Conversion directa ASCII -> EBCDIC");
+        System.out.println("   - Aplica 1014-blocking");
+        System.out.println("   - NO usa estructura RDW");
+        System.out.println();
+        System.out.println("4. DECODE - Decodificar EBCDIC plano a ASCII (sin RDW)");
+        System.out.println("   java IpmConverter decode --input <ebc> --output <txt>");
+        System.out.println();
+        System.out.println("   Para: T007, T113, T121, T140, T150, T067, T068, T167, T168");
+        System.out.println("   - Auto-detecta y remueve 1014-blocking");
+        System.out.println("   - Conversion directa EBCDIC -> ASCII");
+        System.out.println("   - NO parsea RDW");
         System.out.println();
         System.out.println("DEBUG:");
         System.out.println("  java -Dipm.debug=true IpmConverter <comando> ...");
         System.out.println();
         System.out.println("EJEMPLOS:");
-        System.out.println("  # Decodificar IPM recibido");
-        System.out.println("  java IpmConverter decode --input T112IN.ipm --output decoded.txt");
         System.out.println();
-        System.out.println("  # Codificar para envio");
-        System.out.println("  java IpmConverter encode --input records.txt --output T140OUT.ipm");
+        System.out.println("  # Codificar para envio IPM");
+        System.out.println("  java IpmConverter encodeipm --input datos.txt --output R119.ipm");
+        System.out.println();
+        System.out.println("  # Decodificar respuesta IPM");
+        System.out.println("  java IpmConverter decodeipm --input T112.ipm --output respuesta.txt");
         System.out.println();
         System.out.println("  # Decodificar reporte T150");
-        System.out.println("  java IpmConverter t150 --input T150REPORT.ipm --output report.txt");
+        System.out.println("  java IpmConverter decode --input T150.ipm --output reporte.txt");
         System.out.println();
-        System.out.println("  # Conversion RAW para debug");
-        System.out.println("  java IpmConverter raw --input file.ebc --output file.txt");
-        System.out.println("                        --direction e2a");
+        System.out.println("  # Codificar reporte generico");
+        System.out.println("  java IpmConverter encode --input datos.txt --output salida.ebc");
         System.out.println();
         System.out.println("REFERENCIAS:");
         System.out.println("  - GCMS Reference Manual (mc_gcms.pdf)");
-        System.out.println("  - File Transfer Manual (File_Transfer_Manual_-_Mastercard.pdf)");
-        System.out.println("  - Layout 1014: 1012 bytes datos + 2 bytes padding (0x40)");
-        System.out.println("  - T150: Clearing Cycle Reports (Test)");
+        System.out.println("  - EBCDIC: Cp500 (IBM International)");
+        System.out.println("  - 1014-blocking: [1012 datos][2 padding 0x40]");
         System.out.println("=================================================================");
     }
 }
