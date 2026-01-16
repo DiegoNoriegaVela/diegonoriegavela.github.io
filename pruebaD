@@ -1,11 +1,10 @@
 import java.io.BufferedReader;
 import java.io.BufferedOutputStream;
 import java.io.File;
-import java.io.FileInputStream; // Nuevo import para compatibilidad
+import java.io.FileInputStream; 
 import java.io.FileOutputStream;
-import java.io.InputStreamReader; // Nuevo import para compatibilidad
+import java.io.InputStreamReader; 
 import java.io.IOException;
-// Eliminamos StandardCharsets para máxima compatibilidad con Java 6/7/8
 
 public class IsoBitmapHexToBinaryConverter {
 
@@ -17,6 +16,7 @@ public class IsoBitmapHexToBinaryConverter {
         String inputFileBasePath = null;
         String outputFileBasePath = null;
 
+        // Procesamiento de argumentos
         for (int i = 0; i < args.length; i++) {
             if ("--input".equals(args[i]) && i + 1 < args.length) {
                 inputFileBasePath = args[i + 1];
@@ -27,9 +27,10 @@ public class IsoBitmapHexToBinaryConverter {
             }
         }
 
+        // Validaciones básicas
         if (inputFileBasePath == null || outputFileBasePath == null) {
-            System.err.println("Error: Faltan parametros.");
-            System.err.println("Uso: java IsoBitmapHexToBinaryConverter --input <origen> --output <destino>");
+            System.err.println("Error: Faltan parametros obligatorios.");
+            System.err.println("Uso: java IsoBitmapHexToBinaryConverter --input <ruta_origen> --output <ruta_destino>");
             System.exit(1);
         }
 
@@ -41,19 +42,20 @@ public class IsoBitmapHexToBinaryConverter {
             System.exit(1);
         }
 
-        System.out.println("Procesando en AS/400...");
-        System.out.println("In: " + inputFile.getAbsolutePath());
-        System.out.println("Out: " + outputFile.getAbsolutePath());
+        System.out.println("Iniciando procesamiento (Compatible AS/400)...");
+        System.out.println("Entrada: " + inputFile.getAbsolutePath());
+        System.out.println("Salida:  " + outputFile.getAbsolutePath());
 
-        // CAMBIO PRINCIPAL AQUI:
-        // Usamos FileInputStream + InputStreamReader en lugar de FileReader.
-        // Esto funciona en Java 7, 8 y versiones antiguas del AS/400.
         BufferedReader reader = null;
         BufferedOutputStream writer = null;
 
         try {
-            // Forzamos la lectura en US-ASCII para evitar problemas de EBCDIC en el AS400
+            // 1. Lectura: Usamos InputStreamReader con "US-ASCII" para asegurar que 
+            // leemos la entrada hexadecimal correctamente en cualquier entorno (incluido EBCDIC).
             reader = new BufferedReader(new InputStreamReader(new FileInputStream(inputFile), "US-ASCII"));
+            
+            // 2. Escritura: Usamos BufferedOutputStream estándar.
+            // En tu entorno AS/400, esto parece generar el formato visual "Ø" que necesitas.
             writer = new BufferedOutputStream(new FileOutputStream(outputFile));
 
             String line;
@@ -63,68 +65,81 @@ public class IsoBitmapHexToBinaryConverter {
             while ((line = reader.readLine()) != null) {
                 lineNumber++;
 
+                // Ignorar líneas vacías o incompletas
                 if (line.length() < TOTAL_PREFIX_LENGTH) {
-                    System.err.println("Linea " + lineNumber + " muy corta, omitida.");
                     continue;
                 }
 
                 try {
+                    // Separar las partes
                     String mtiStr = line.substring(0, MTI_LENGTH);
                     String hexBitmapStr = line.substring(MTI_LENGTH, TOTAL_PREFIX_LENGTH);
                     String restOfDataStr = line.substring(TOTAL_PREFIX_LENGTH);
 
+                    // Convertir el bitmap hex a bytes
                     byte[] binaryBitmap = hexStringToByteArray(hexBitmapStr);
 
-                    // Escribir MTI
+                    // --- ESCRITURA ---
+                    // Escribimos las partes. Al usar getBytes("US-ASCII") para el texto
+                    // y escribir el bitmap binario directamente, dejamos que el entorno
+                    // maneje la representación final.
+
+                    // 1. Escribir MTI (como ASCII)
                     writer.write(mtiStr.getBytes("US-ASCII"));
 
-                    // Escribir Bitmap BINARIO
+                    // 2. Escribir Bitmap BINARIO
                     writer.write(binaryBitmap);
 
-                    // Escribir el resto
+                    // 3. Escribir el resto de los datos (como ASCII)
                     writer.write(restOfDataStr.getBytes("US-ASCII"));
                     
-                    // Salto de línea
+                    // 4. Escribir salto de línea estándar
                     writer.write('\n');
 
                     processedCount++;
 
                 } catch (IllegalArgumentException e) {
-                    System.err.println("Error linea " + lineNumber + ": Bitmap invalido.");
+                    System.err.println("Error en línea " + lineNumber + ": Bitmap hexadecimal inválido. Se omite el registro.");
                 } catch (Exception e) {
-                     System.err.println("Error procesando linea " + lineNumber);
+                     System.err.println("Error inesperado procesando línea " + lineNumber + ": " + e.getMessage());
                 }
             }
             
+            // Asegurar que todos los datos queden guardados en disco
             writer.flush();
-            System.out.println("Fin. Total procesados: " + processedCount);
+            System.out.println("Procesamiento completado. Se generaron " + processedCount + " registros.");
 
         } catch (IOException e) {
-            System.err.println("Error de E/S: " + e.getMessage());
+            System.err.println("Error crítico de Entrada/Salida: " + e.getMessage());
             e.printStackTrace();
         } finally {
-            // Bloque finally para cerrar recursos de forma segura en Java antiguo
+            // Cierre seguro de recursos para versiones antiguas de Java
             try {
                 if (reader != null) reader.close();
                 if (writer != null) writer.close();
             } catch (IOException ex) {
-                ex.printStackTrace();
+                // Ignorar errores al cerrar
             }
         }
     }
 
+    /**
+     * Convierte una cadena hexadecimal de 32 caracteres en un array de 16 bytes.
+     */
     private static byte[] hexStringToByteArray(String s) {
         int len = s.length();
-        if (len % 2 != 0) {
-             throw new IllegalArgumentException("Longitud impar");
+        // Validación estricta para bitmap ISO8583 primario (32 chars hex)
+        if (len != BITMAP_HEX_LENGTH) {
+             throw new IllegalArgumentException("La longitud del bitmap hex debe ser exactamente 32 caracteres");
         }
         byte[] data = new byte[len / 2];
         for (int i = 0; i < len; i += 2) {
             int digit1 = Character.digit(s.charAt(i), 16);
             int digit2 = Character.digit(s.charAt(i + 1), 16);
             if (digit1 == -1 || digit2 == -1) {
-                 throw new IllegalArgumentException("Caracter no hex");
+                 throw new IllegalArgumentException("Carácter no hexadecimal encontrado en el bitmap");
             }
+            // Combina dos dígitos hex en un byte
             data[i / 2] = (byte) ((digit1 << 4) + digit2);
         }
         return data;
