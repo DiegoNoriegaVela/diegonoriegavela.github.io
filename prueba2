@@ -1,154 +1,78 @@
+import java.io.*;
+
 /**
- * MipParams - Parametros unificados para el sistema MIP
+ * MipConfig - Configuracion centralizada del sistema MIP
  * 
- * Parsea y almacena parametros de linea de comandos.
- * Usada por MipManager y MipFileTransfer.
- * 
- * Parametros soportados:
- * - mode: send o receive
- * - ip: Direccion IP del MIP
- * - port: Puerto del MIP
- * - file: Path del archivo origen/destino o "auto"
- * - encode: EBCDIC o ASCII (solo MipManager)
- * - ipmName: Transmission ID
- * - date: Fecha en formato YYYYMMDD
+ * Carga y almacena configuracion desde mipmanager.ini.
+ * Usada por MipManager y potencialmente otros componentes.
  */
-public class MipParams {
+public class MipConfig {
     
-    public String mode;
-    public String ip;
-    public int port;
-    public String file;        // 'filePath' en MipFileTransfer
-    public String encode;      // Solo usado por MipManager
-    public String ipmName;
-    public String date;        // 'customDate' en MipFileTransfer
+    public String miplog = null;
+    public String autoNameReceive = null;
+    
+    private static final boolean DEBUG = Boolean.getBoolean("mip.debug");
     
     /**
-     * Parsea argumentos de linea de comandos
+     * Carga configuracion desde mipmanager.ini
      * 
-     * Soporta formatos:
-     * - --parametro=valor
-     * - --parametro valor
-     * 
-     * @param args Array de argumentos
-     * @param requireEncode Si true, valida que --encode este presente (MipManager)
-     * @return Objeto MipParams parseado, o null si hay error
+     * @return Objeto MipConfig con valores cargados
      */
-    public static MipParams parse(String[] args, boolean requireEncode) {
-        MipParams p = new MipParams();
+    public static MipConfig load() {
+        MipConfig cfg = new MipConfig();
         
-        for (int i = 0; i < args.length; i++) {
-            String arg = args[i];
-            
-            if (arg.startsWith("--mode=")) {
-                p.mode = arg.substring(7);
-            } else if (arg.equals("--mode") && i + 1 < args.length) {
-                p.mode = args[++i];
-                
-            } else if (arg.startsWith("--ip=")) {
-                p.ip = arg.substring(5);
-            } else if (arg.equals("--ip") && i + 1 < args.length) {
-                p.ip = args[++i];
-                
-            } else if (arg.startsWith("--port=")) {
-                try {
-                    p.port = Integer.parseInt(arg.substring(7));
-                } catch (NumberFormatException e) {
-                    System.err.println("ERROR: Puerto invalido: " + arg.substring(7));
-                    return null;
-                }
-            } else if (arg.equals("--port") && i + 1 < args.length) {
-                try {
-                    p.port = Integer.parseInt(args[++i]);
-                } catch (NumberFormatException e) {
-                    System.err.println("ERROR: Puerto invalido: " + args[i]);
-                    return null;
-                }
-                
-            } else if (arg.startsWith("--file=")) {
-                p.file = arg.substring(7);
-            } else if (arg.equals("--file") && i + 1 < args.length) {
-                p.file = args[++i];
-                
-            } else if (arg.startsWith("--encode=")) {
-                p.encode = arg.substring(9);
-            } else if (arg.equals("--encode") && i + 1 < args.length) {
-                p.encode = args[++i];
-                
-            } else if (arg.startsWith("--ipmname=")) {
-                p.ipmName = arg.substring(10);
-            } else if (arg.equals("--ipmname") && i + 1 < args.length) {
-                p.ipmName = args[++i];
-                
-            } else if (arg.startsWith("--date=")) {
-                p.date = arg.substring(7);
-            } else if (arg.equals("--date") && i + 1 < args.length) {
-                p.date = args[++i];
-                
-            } else {
-                System.err.println("ERROR: Parametro desconocido: " + arg);
-                return null;
+        File iniFile = new File("mipmanager.ini");
+        if (!iniFile.exists()) {
+            if (DEBUG) {
+                System.out.println("DEBUG: mipmanager.ini no encontrado");
             }
+            return cfg;
         }
         
-        // Validar parametros requeridos basicos
-        if (p.mode == null || p.ip == null || p.port == 0 || 
-            p.file == null || p.ipmName == null) {
+        try (BufferedReader reader = new BufferedReader(new FileReader(iniFile))) {
+            String line;
+            boolean inGeneralSection = false;
             
-            System.err.println("ERROR: Faltan parametros requeridos");
-            if (p.mode == null) System.err.println("  - Falta --mode");
-            if (p.ip == null) System.err.println("  - Falta --ip");
-            if (p.port == 0) System.err.println("  - Falta --port");
-            if (p.file == null) System.err.println("  - Falta --file");
-            if (p.ipmName == null) System.err.println("  - Falta --ipmname");
-            return null;
+            while ((line = reader.readLine()) != null) {
+                line = line.trim();
+                
+                if (line.isEmpty() || line.startsWith("#") || line.startsWith(";")) {
+                    continue;
+                }
+                
+                if (line.equals("[GENERAL]")) {
+                    inGeneralSection = true;
+                    continue;
+                }
+                
+                if (line.startsWith("[") && line.endsWith("]")) {
+                    inGeneralSection = false;
+                    continue;
+                }
+                
+                if (inGeneralSection && line.contains("=")) {
+                    int eqIdx = line.indexOf('=');
+                    String key = line.substring(0, eqIdx).trim().toLowerCase();
+                    String value = line.substring(eqIdx + 1).trim();
+                    
+                    if (key.equals("miplog")) {
+                        cfg.miplog = value;
+                    } else if (key.equals("autonamereceive")) {
+                        cfg.autoNameReceive = value;
+                    }
+                }
+            }
+            
+            if (DEBUG) {
+                System.out.println("DEBUG: Configuracion cargada:");
+                System.out.println("  miplog=" + cfg.miplog);
+                System.out.println("  autoNameReceive=" + cfg.autoNameReceive);
+            }
+            
+        } catch (IOException e) {
+            System.err.println("ADVERTENCIA: Error leyendo mipmanager.ini: " + e.getMessage());
         }
         
-        // Validar encode si es requerido (MipManager)
-        if (requireEncode && p.encode == null) {
-            System.err.println("ERROR: Falta --encode");
-            return null;
-        }
-        
-        // Validar valores de mode
-        if (!"send".equalsIgnoreCase(p.mode) && !"receive".equalsIgnoreCase(p.mode)) {
-            System.err.println("ERROR: --mode debe ser 'send' o 'receive'");
-            return null;
-        }
-        
-        // Validar valores de encode si esta presente
-        if (p.encode != null && 
-            !"EBCDIC".equalsIgnoreCase(p.encode) && !"ASCII".equalsIgnoreCase(p.encode)) {
-            System.err.println("ERROR: --encode debe ser 'EBCDIC' o 'ASCII'");
-            return null;
-        }
-        
-        // Validaciones de --date
-        if ("receive".equalsIgnoreCase(p.mode) && p.date == null) {
-            System.err.println("ERROR: El parametro --date es OBLIGATORIO para modo receive");
-            System.err.println("       Formato: --date YYYYMMDD (ejemplo: --date 20251103)");
-            return null;
-        }
-        
-        if ("send".equalsIgnoreCase(p.mode) && p.date != null) {
-            System.err.println("ERROR: El parametro --date NO es valido para modo send");
-            System.err.println("       En modo send, la fecha se calcula automaticamente");
-            return null;
-        }
-        
-        if (p.date != null && !p.date.matches("\\d{8}")) {
-            System.err.println("ERROR: Formato de fecha invalido en --date");
-            System.err.println("       Use formato YYYYMMDD (8 digitos)");
-            return null;
-        }
-        
-        return p;
-    }
-    
-    /**
-     * Version simplificada para MipFileTransfer (no requiere encode)
-     */
-    public static MipParams parse(String[] args) {
-        return parse(args, false);
+        return cfg;
     }
 }
