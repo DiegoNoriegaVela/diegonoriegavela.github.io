@@ -1,5 +1,413 @@
-Manifest-Version: 1.0
-Main-Class: com.scotiabank.mip.MipManager
-Created-By: Scotiabank MIP Team
-Implementation-Title: MIP Manager
-Implementation-Version: 1.0.0
+package com.scotiabank.mip;
+
+import java.io.*;
+import java.text.SimpleDateFormat;
+import java.util.Date;
+import java.util.Properties;
+
+/**
+ * MipManager - Gestor Principal de Transferencia MIP Mastercard
+ * 
+ * Clase principal que coordina las operaciones de envio y recepcion
+ * de archivos IPM hacia/desde el MIP de Mastercard.
+ * 
+ * USO:
+ *   java -jar mipmgr-1.0.0.jar --mode send --ip <host> --port <puerto> 
+ *        --file <archivo> --ipmname <nombre> --date <YYYYMMDD> --encode <ASCII|EBCDIC>
+ * 
+ *   java -jar mipmgr-1.0.0.jar --mode receive --ip <host> --port <puerto>
+ *        --file <archivo|auto> --ipmname <nombre> --date <YYYYMMDD> --encode <ASCII|EBCDIC>
+ * 
+ * CONFIGURACION:
+ *   El archivo mipmanager.ini debe estar junto al JAR.
+ * 
+ * @version 1.0.0
+ */
+public class MipManager {
+
+    private static final String VERSION = "1.0.0";
+    private static final String TEMP_DIR = System.getProperty("java.io.tmpdir");
+    
+    // Configuracion cargada desde mipmanager.ini
+    private static Config config = null;
+
+    public static void main(String[] args) {
+        try {
+            // Mostrar version
+            System.out.println("MipManager v" + VERSION);
+            System.out.println("");
+            
+            // Cargar configuracion
+            config = loadConfig();
+            
+            // Parsear parametros
+            Params p = Params.parse(args);
+            if (p == null) {
+                printUsage();
+                System.exit(2);
+            }
+
+            // Ejecutar operacion
+            if ("send".equalsIgnoreCase(p.mode)) {
+                executeSend(p);
+            } else if ("receive".equalsIgnoreCase(p.mode)) {
+                executeReceive(p);
+            } else {
+                System.err.println("ERROR: Modo invalido '" + p.mode + "'. Use 'send' o 'receive'");
+                printUsage();
+                System.exit(2);
+            }
+
+            System.exit(0);
+
+        } catch (Exception e) {
+            System.err.println("\n==============================================");
+            System.err.println("ERROR");
+            System.err.println("==============================================");
+            System.err.println(e.getMessage());
+            System.err.println("==============================================");
+            System.exit(1);
+        }
+    }
+
+    // ========================================================================
+    // MODO SEND
+    // ========================================================================
+
+    private static void executeSend(Params p) throws Exception {
+        File sourceFile = new File(p.file);
+        if (!sourceFile.exists()) {
+            throw new FileNotFoundException("Archivo no encontrado: " + p.file);
+        }
+
+        System.out.println("==============================================");
+        System.out.println("MIP MANAGER - MODO SEND");
+        System.out.println("==============================================");
+        System.out.println("Archivo origen : " + sourceFile.getName());
+        System.out.println("Formato        : " + p.encode);
+        System.out.println("IPM Name       : " + p.ipmName);
+        System.out.println("Fecha          : " + p.date);
+        System.out.println("MIP destino    : " + p.ip + ":" + p.port);
+        System.out.println("==============================================\n");
+
+        MipFileTransfer.TransferResult result;
+
+        if ("EBCDIC".equalsIgnoreCase(p.encode)) {
+            // Archivo ya en formato EBCDIC - transferencia directa
+            System.out.println("[MODO DIRECTO] Archivo ya en formato EBCDIC\n");
+            
+            result = MipFileTransfer.send(p.ip, p.port, p.file, p.ipmName, p.date);
+
+        } else if ("ASCII".equalsIgnoreCase(p.encode)) {
+            // Archivo ASCII - requiere conversion
+            System.out.println("[MODO CONVERSION] Convirtiendo ASCII a EBCDIC\n");
+
+            File tempIpm = null;
+            try {
+                // Paso 1: Convertir ASCII a IPM
+                System.out.println("[1/2] Codificando archivo...");
+                tempIpm = createTempFile("ipm_", ".dat");
+                IpmConverter.encode(p.file, tempIpm.getAbsolutePath());
+                System.out.println("");
+
+                // Paso 2: Transferir
+                System.out.println("[2/2] Transfiriendo archivo...");
+                result = MipFileTransfer.send(p.ip, p.port, tempIpm.getAbsolutePath(), p.ipmName, p.date);
+
+            } finally {
+                // Limpiar temporal
+                if (tempIpm != null && tempIpm.exists()) {
+                    tempIpm.delete();
+                }
+            }
+
+        } else {
+            throw new IllegalArgumentException("Valor invalido para --encode: " + p.encode);
+        }
+
+        // Registrar envio exitoso en log
+        if (result.success && config != null && config.miplog != null) {
+            logSendSuccess(result.serverResponse, result.transmissionId);
+        }
+    }
+
+    // ========================================================================
+    // MODO RECEIVE
+    // ========================================================================
+
+    private static void executeReceive(Params p) throws Exception {
+        // Resolver nombre de archivo destino
+        String finalPath = p.file;
+        if ("auto".equalsIgnoreCase(p.file)) {
+            if (config == null || config.autoNameReceive == null) {
+                throw new IllegalArgumentException(
+                    "Modo 'auto' requiere configuracion 'autoNameReceive' en mipmanager.ini");
+            }
+            finalPath = resolveAutoName(config.autoNameReceive, p.ipmName, p.date);
+        }
+
+        System.out.println("==============================================");
+        System.out.println("MIP MANAGER - MODO RECEIVE");
+        System.out.println("==============================================");
+        System.out.println("Archivo destino: " + finalPath);
+        System.out.println("Formato        : " + p.encode);
+        System.out.println("IPM Name       : " + p.ipmName);
+        System.out.println("Fecha          : " + p.date);
+        System.out.println("MIP origen     : " + p.ip + ":" + p.port);
+        System.out.println("==============================================\n");
+
+        if ("EBCDIC".equalsIgnoreCase(p.encode)) {
+            // Recibir directamente en EBCDIC
+            System.out.println("[MODO DIRECTO] Guardando en formato EBCDIC\n");
+            
+            MipFileTransfer.receive(p.ip, p.port, finalPath, p.ipmName, p.date);
+
+        } else if ("ASCII".equalsIgnoreCase(p.encode)) {
+            // Recibir y convertir a ASCII
+            System.out.println("[MODO CONVERSION] Convirtiendo EBCDIC a ASCII\n");
+
+            File tempIpm = null;
+            try {
+                // Paso 1: Recibir a temporal
+                System.out.println("[1/2] Recibiendo archivo...");
+                tempIpm = createTempFile("ipm_recv_", ".dat");
+                MipFileTransfer.TransferResult result = MipFileTransfer.receive(
+                    p.ip, p.port, tempIpm.getAbsolutePath(), p.ipmName, p.date);
+                System.out.println("");
+
+                // Paso 2: Decodificar
+                System.out.println("[2/2] Decodificando archivo...");
+                IpmConverter.decode(tempIpm.getAbsolutePath(), finalPath);
+
+            } finally {
+                // Limpiar temporal
+                if (tempIpm != null && tempIpm.exists()) {
+                    tempIpm.delete();
+                }
+            }
+
+        } else {
+            throw new IllegalArgumentException("Valor invalido para --encode: " + p.encode);
+        }
+
+        System.out.println("\nArchivo guardado: " + finalPath);
+    }
+
+    // ========================================================================
+    // CONFIGURACION
+    // ========================================================================
+
+    private static Config loadConfig() {
+        Config cfg = new Config();
+        
+        // Buscar mipmanager.ini junto al JAR
+        File jarDir = getJarDirectory();
+        File iniFile = new File(jarDir, "mipmanager.ini");
+        
+        if (!iniFile.exists()) {
+            System.out.println("ADVERTENCIA: No se encontro mipmanager.ini en " + jarDir.getAbsolutePath());
+            System.out.println("             Algunas funciones pueden no estar disponibles.\n");
+            return cfg;
+        }
+
+        try {
+            Properties props = new Properties();
+            FileInputStream fis = new FileInputStream(iniFile);
+            try {
+                props.load(fis);
+            } finally {
+                fis.close();
+            }
+
+            cfg.miplog = props.getProperty("miplog");
+            cfg.autoNameReceive = props.getProperty("autoNameReceive");
+
+            System.out.println("Configuracion cargada desde: " + iniFile.getAbsolutePath());
+            if (cfg.miplog != null) {
+                System.out.println("  miplog         : " + cfg.miplog);
+            }
+            if (cfg.autoNameReceive != null) {
+                System.out.println("  autoNameReceive: " + cfg.autoNameReceive);
+            }
+            System.out.println("");
+
+        } catch (Exception e) {
+            System.err.println("ADVERTENCIA: Error leyendo mipmanager.ini: " + e.getMessage());
+        }
+
+        return cfg;
+    }
+
+    private static File getJarDirectory() {
+        try {
+            String path = MipManager.class.getProtectionDomain()
+                .getCodeSource().getLocation().toURI().getPath();
+            File file = new File(path);
+            if (file.isFile()) {
+                return file.getParentFile();
+            }
+            return file;
+        } catch (Exception e) {
+            return new File(".");
+        }
+    }
+
+    // ========================================================================
+    // UTILIDADES
+    // ========================================================================
+
+    private static String resolveAutoName(String pattern, String ipmName, String date) {
+        String result = pattern;
+        
+        // Reemplazar TXXX con primeros 4 caracteres del ipmname
+        if (ipmName.length() >= 4) {
+            result = result.replace("TXXX", ipmName.substring(0, 4));
+        }
+        
+        // Reemplazar AAAAMMDD con la fecha
+        result = result.replace("AAAAMMDD", date);
+        
+        return result;
+    }
+
+    private static File createTempFile(String prefix, String suffix) throws IOException {
+        File tempFile = File.createTempFile(prefix, suffix, new File(TEMP_DIR));
+        tempFile.deleteOnExit();
+        return tempFile;
+    }
+
+    private static void logSendSuccess(String serverResponse, String transmissionId) {
+        if (config == null || config.miplog == null) return;
+        
+        try {
+            String timestamp = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss").format(new Date());
+            String logEntry = "[" + serverResponse + "-" + transmissionId + ": " + timestamp + "]\n";
+            
+            FileWriter fw = new FileWriter(config.miplog, true);
+            try {
+                fw.write(logEntry);
+            } finally {
+                fw.close();
+            }
+            
+            System.out.println("\nRegistrado en log: " + config.miplog);
+            
+        } catch (Exception e) {
+            System.err.println("ADVERTENCIA: No se pudo escribir en log: " + e.getMessage());
+        }
+    }
+
+    private static void printUsage() {
+        System.out.println(
+            "MipManager v" + VERSION + " - Gestor de Transferencia MIP Mastercard\n" +
+            "\n" +
+            "Uso:\n" +
+            "  ENVIO:\n" +
+            "    java -jar mipmgr-1.0.0.jar --mode send --ip <host> --port <puerto> \\\n" +
+            "         --file <archivo> --ipmname <nombre> --date <YYYYMMDD> --encode <ASCII|EBCDIC>\n" +
+            "\n" +
+            "  RECEPCION:\n" +
+            "    java -jar mipmgr-1.0.0.jar --mode receive --ip <host> --port <puerto> \\\n" +
+            "         --file <archivo|auto> --ipmname <nombre> --date <YYYYMMDD> --encode <ASCII|EBCDIC>\n" +
+            "\n" +
+            "Parametros:\n" +
+            "  --mode     : 'send' o 'receive'\n" +
+            "  --ip       : Direccion IP del MIP\n" +
+            "  --port     : Puerto del MIP\n" +
+            "  --file     : Archivo de entrada/salida (o 'auto' en receive)\n" +
+            "  --ipmname  : Identificador IPM (9 o 14 caracteres)\n" +
+            "  --date     : Fecha en formato YYYYMMDD\n" +
+            "  --encode   : Formato del archivo: ASCII o EBCDIC\n" +
+            "\n" +
+            "Configuracion:\n" +
+            "  El archivo mipmanager.ini debe estar junto al JAR.\n" +
+            "\n" +
+            "Ejemplos:\n" +
+            "  java -jar mipmgr-1.0.0.jar --mode send --ip 10.0.0.1 --port 6246 \\\n" +
+            "       --file datos.txt --ipmname R27802840 --date 20250115 --encode ASCII\n" +
+            "\n" +
+            "  java -jar mipmgr-1.0.0.jar --mode receive --ip 10.0.0.1 --port 6246 \\\n" +
+            "       --file auto --ipmname T27902840 --date 20250115 --encode ASCII\n"
+        );
+    }
+
+    // ========================================================================
+    // CLASES INTERNAS
+    // ========================================================================
+
+    private static class Config {
+        String miplog;
+        String autoNameReceive;
+    }
+
+    private static class Params {
+        String mode;
+        String ip;
+        int port;
+        String file;
+        String ipmName;
+        String date;
+        String encode;
+
+        static Params parse(String[] args) {
+            Params p = new Params();
+
+            for (int i = 0; i < args.length; i++) {
+                String s = args[i];
+
+                if (s.startsWith("--mode=")) {
+                    p.mode = s.substring(7);
+                } else if (s.equals("--mode") && i + 1 < args.length) {
+                    p.mode = args[++i];
+                } else if (s.startsWith("--ip=")) {
+                    p.ip = s.substring(5);
+                } else if (s.equals("--ip") && i + 1 < args.length) {
+                    p.ip = args[++i];
+                } else if (s.startsWith("--port=")) {
+                    p.port = Integer.parseInt(s.substring(7));
+                } else if (s.equals("--port") && i + 1 < args.length) {
+                    p.port = Integer.parseInt(args[++i]);
+                } else if (s.startsWith("--file=")) {
+                    p.file = s.substring(7);
+                } else if (s.equals("--file") && i + 1 < args.length) {
+                    p.file = args[++i];
+                } else if (s.startsWith("--ipmname=")) {
+                    p.ipmName = s.substring(10);
+                } else if (s.equals("--ipmname") && i + 1 < args.length) {
+                    p.ipmName = args[++i];
+                } else if (s.startsWith("--date=")) {
+                    p.date = s.substring(7);
+                } else if (s.equals("--date") && i + 1 < args.length) {
+                    p.date = args[++i];
+                } else if (s.startsWith("--encode=")) {
+                    p.encode = s.substring(9);
+                } else if (s.equals("--encode") && i + 1 < args.length) {
+                    p.encode = args[++i];
+                }
+            }
+
+            // Validaciones
+            if (p.mode == null || p.ip == null || p.port == 0 ||
+                p.file == null || p.ipmName == null || p.date == null || p.encode == null) {
+                return null;
+            }
+
+            if (!p.date.matches("\\d{8}")) {
+                System.err.println("ERROR: Formato de fecha invalido. Use YYYYMMDD");
+                return null;
+            }
+
+            if (p.ipmName.length() != 9 && p.ipmName.length() != 14) {
+                System.err.println("ERROR: ipmname debe tener 9 o 14 caracteres");
+                return null;
+            }
+
+            if (!"ASCII".equalsIgnoreCase(p.encode) && !"EBCDIC".equalsIgnoreCase(p.encode)) {
+                System.err.println("ERROR: encode debe ser ASCII o EBCDIC");
+                return null;
+            }
+
+            return p;
+        }
+    }
+}
