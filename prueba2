@@ -67,14 +67,14 @@ public class MipManager {
             throw new FileNotFoundException("Archivo no encontrado: " + p.file);
         }
 
-        String transmissionId;
+        MipFileTransfer.MipTransferResult result = null;
 
         if ("EBCDIC".equalsIgnoreCase(p.encode)) {
             // CASO 1: Archivo ya en EBCDIC - envio directo
             System.out.println("[MODO DIRECTO] Archivo ya en formato EBCDIC");
             System.out.println("Enviando sin conversion...\n");
 
-            transmissionId = MipFileTransfer.sendToMip(p.ip, p.port, p.file, p.ipmName);
+            result = MipFileTransfer.sendToMip(p.ip, p.port, p.file, p.ipmName);
 
             System.out.println("\n==============================================");
             System.out.println("ENVIO COMPLETADO EXITOSAMENTE");
@@ -101,7 +101,7 @@ public class MipManager {
 
                 // PASO 2: Transferir archivo IPM
                 System.out.println("[2/3] Transfiriendo archivo IPM al MIP...");
-                transmissionId = MipFileTransfer.sendToMip(p.ip, p.port, 
+                result = MipFileTransfer.sendToMip(p.ip, p.port, 
                     tempIpm.getAbsolutePath(), p.ipmName);
 
                 System.out.println("\n==============================================");
@@ -123,9 +123,9 @@ public class MipManager {
             throw new IllegalArgumentException("Valor invalido para --encode: " + p.encode);
         }
 
-        // Registrar en log
-        if (cfg.miplog != null) {
-            logTransmission(cfg.miplog, transmissionId);
+        // Registrar en log con codigo de respuesta MIP
+        if (cfg.miplog != null && result != null) {
+            logTransmission(cfg.miplog, result.transmissionId, result.responseCode);
         }
     }
 
@@ -141,24 +141,42 @@ public class MipManager {
         // PASO 1: Descargar archivo desde MIP
         System.out.println("[1/4] Conectando al MIP y solicitando archivo...");
         
-        String downloadedFileName = MipFileTransfer.receiveFromMip(
-            p.ip, p.port, "auto", p.ipmName, p.date);
+        MipFileTransfer.MipTransferResult result = null;
+        
+        try {
+            result = MipFileTransfer.receiveFromMip(p.ip, p.port, "auto", p.ipmName, p.date);
+        } catch (Exception e) {
+            // Registrar intento fallido
+            if (cfg.miplog != null) {
+                logTransmission(cfg.miplog, p.ipmName, "ERROR");
+            }
+            throw e;
+        }
 
-        if (downloadedFileName == null) {
+        if (result == null || result.transmissionId == null) {
+            // Registrar fallo
+            if (cfg.miplog != null) {
+                logTransmission(cfg.miplog, p.ipmName, "ERROR");
+            }
             throw new Exception("No se pudo descargar el archivo desde el MIP");
         }
 
+        // El archivo descargado se llama: {transmissionId}.EBCDIC
+        String downloadedFileName = result.transmissionId + ".EBCDIC";
         File downloadedIpmFile = new File(downloadedFileName);
+        
         if (!downloadedIpmFile.exists()) {
+            // Registrar error
+            if (cfg.miplog != null) {
+                logTransmission(cfg.miplog, result.transmissionId, "ERROR");
+            }
             throw new FileNotFoundException("Archivo descargado no encontrado: " + downloadedFileName);
         }
 
         System.out.println("Archivo descargado: " + downloadedIpmFile.getName());
 
         // PASO 2: Extraer nombre del archivo IPM (sin extension)
-        String headerName = downloadedIpmFile.getName();
-        int extIndex = headerName.lastIndexOf('.');
-        headerName = (extIndex > 0) ? headerName.substring(0, extIndex) : headerName;
+        String headerName = result.transmissionId;
 
         if (DEBUG) {
             System.out.println("DEBUG: Header a insertar: [" + headerName + "]");
@@ -169,41 +187,55 @@ public class MipManager {
 
         String finalDestinationPath = p.file;
 
-        if ("EBCDIC".equalsIgnoreCase(p.encode)) {
-            // CASO 1: Mantener EBCDIC con header
-            System.out.println("Modo EBCDIC: Copiando contenido con header...");
-            
-            prependHeaderAndCopy(downloadedIpmFile, finalDestinationPath, headerName);
-            
-            System.out.println("Archivo guardado: " + finalDestinationPath);
+        try {
+            if ("EBCDIC".equalsIgnoreCase(p.encode)) {
+                // CASO 1: Mantener EBCDIC con header
+                System.out.println("Modo EBCDIC: Copiando contenido con header...");
+                
+                prependHeaderAndCopy(downloadedIpmFile, finalDestinationPath, headerName);
+                
+                System.out.println("Archivo guardado: " + finalDestinationPath);
 
-        } else if ("ASCII".equalsIgnoreCase(p.encode)) {
-            // CASO 2: Convertir a ASCII con header
-            System.out.println("Modo ASCII: Decodificando IPM...");
-            
-            // Llamar directamente a IpmConverter
-            convertIpmToAscii(downloadedIpmFile.getAbsolutePath(), 
-                finalDestinationPath, headerName, downloadedIpmFile.getName());
+            } else if ("ASCII".equalsIgnoreCase(p.encode)) {
+                // CASO 2: Convertir a ASCII con header
+                System.out.println("Modo ASCII: Decodificando IPM...");
+                
+                // Llamar directamente a IpmConverter
+                convertIpmToAscii(downloadedIpmFile.getAbsolutePath(), 
+                    finalDestinationPath, headerName, result.transmissionId);
 
-            System.out.println("Archivo guardado: " + finalDestinationPath);
+                System.out.println("Archivo guardado: " + finalDestinationPath);
 
-        } else {
-            throw new IllegalArgumentException("Valor invalido para --encode: " + p.encode);
-        }
-
-        // PASO 4: Limpiar archivo temporal descargado
-        System.out.println("[3/4] Limpiando archivos temporales...");
-        if (downloadedIpmFile.exists()) {
-            downloadedIpmFile.delete();
-            if (DEBUG) {
-                System.out.println("DEBUG: Eliminado: " + downloadedIpmFile.getName());
+            } else {
+                throw new IllegalArgumentException("Valor invalido para --encode: " + p.encode);
             }
-        }
 
-        System.out.println("\n==============================================");
-        System.out.println("RECEPCION COMPLETADA EXITOSAMENTE");
-        System.out.println("Archivo: " + finalDestinationPath);
-        System.out.println("==============================================");
+            // PASO 4: Limpiar archivo temporal descargado
+            System.out.println("[3/4] Limpiando archivos temporales...");
+            if (downloadedIpmFile.exists()) {
+                downloadedIpmFile.delete();
+                if (DEBUG) {
+                    System.out.println("DEBUG: Eliminado: " + downloadedIpmFile.getName());
+                }
+            }
+
+            System.out.println("\n==============================================");
+            System.out.println("RECEPCION COMPLETADA EXITOSAMENTE");
+            System.out.println("Archivo: " + finalDestinationPath);
+            System.out.println("==============================================");
+
+            // Registrar recepcion exitosa en log
+            if (cfg.miplog != null) {
+                logTransmission(cfg.miplog, result.transmissionId, result.responseCode);
+            }
+
+        } catch (Exception e) {
+            // Registrar error en procesamiento
+            if (cfg.miplog != null) {
+                logTransmission(cfg.miplog, result.transmissionId, "ERROR");
+            }
+            throw e;
+        }
     }
 
     /* ========================================================================
@@ -295,6 +327,36 @@ public class MipManager {
     }
 
     /* ========================================================================
+     * LOGGING - Registro de eventos en el log del MIP
+     * ======================================================================== */
+
+    /**
+     * Registra transmision en el log del MIP
+     * 
+     * Formato: [responseCode-transmissionId: timestamp]
+     * Ejemplo: [9980100-R1190284001601: 2026-01-16 11:47:19]
+     *          [9980100-T1200284001601: 2026-01-16 11:50:23]
+     */
+    private static void logTransmission(String logPath, String transmissionId, String responseCode) {
+        try (FileWriter fw = new FileWriter(logPath, true)) {
+            SimpleDateFormat sdf = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss");
+            String timestamp = sdf.format(new Date());
+            
+            String logEntry = "[" + responseCode + "-" + transmissionId + 
+                ": " + timestamp + "]" + System.lineSeparator();
+            
+            fw.write(logEntry);
+            
+            if (DEBUG) {
+                System.out.println("DEBUG: Log registrado: " + logEntry.trim());
+            }
+            
+        } catch (IOException e) {
+            System.err.println("ADVERTENCIA: No se pudo escribir en el log: " + e.getMessage());
+        }
+    }
+
+    /* ========================================================================
      * UTILIDADES
      * ======================================================================== */
 
@@ -371,28 +433,6 @@ public class MipManager {
     }
 
     /**
-     * Registra transmision en el log
-     */
-    private static void logTransmission(String logPath, String transmissionId) {
-        try (FileWriter fw = new FileWriter(logPath, true)) {
-            SimpleDateFormat sdf = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss");
-            String timestamp = sdf.format(new Date());
-            
-            String logEntry = "[9980100-" + transmissionId + ": " + timestamp + "]" + 
-                System.lineSeparator();
-            
-            fw.write(logEntry);
-            
-            if (DEBUG) {
-                System.out.println("DEBUG: Registro añadido al log: " + logEntry.trim());
-            }
-            
-        } catch (IOException e) {
-            System.err.println("ADVERTENCIA: No se pudo escribir en el log: " + e.getMessage());
-        }
-    }
-
-    /**
      * Muestra ayuda del programa
      */
     private static void printHelp() {
@@ -432,3 +472,417 @@ public class MipManager {
         System.out.println("=================================================================");
     }
 }
+
+------------------------------------------------------------------------------------------------------------------
+/**
+ * Clase para retornar resultado de transferencia MIP
+ */
+public static class MipTransferResult {
+    public String transmissionId;    // ID completo enviado/recibido
+    public String responseCode;       // Codigo de respuesta del MIP
+    
+    public MipTransferResult(String transmissionId, String responseCode) {
+        this.transmissionId = transmissionId;
+        this.responseCode = responseCode;
+    }
+}
+
+---------------------------------------------------------------------------------------------------------------------
+public static MipTransferResult receiveFromMip(String ip, int port, String file, 
+        String ipmName, String date) throws Exception {
+    
+    // Determinar si ipmName ya es un Transmission ID completo (14 caracteres)
+    boolean isFullTransmissionId = (ipmName != null && ipmName.length() == 14);
+    
+    String txid;
+    if (isFullTransmissionId) {
+        // Ya es completo, usar tal cual sin normalizar
+        txid = ipmName;
+        System.out.println("Transmission ID completo detectado: " + txid);
+    } else {
+        // Normalizar a 14 caracteres con fecha personalizada
+        txid = normalizeTransmissionId(ipmName, null, date);
+    }
+
+    // Determinar si se usara nombre automatico
+    boolean useAutoNaming = "auto".equalsIgnoreCase(file);
+    String finalFilePath = file;
+
+    System.out.println("=================================================");
+    System.out.println("INICIA PROCESO DE RECEPCION (FROM MASTERCARD)");
+    System.out.println("=================================================");
+    if (useAutoNaming) {
+        System.out.println("Modo..........: AUTO (nombre basado en Header)");
+    } else {
+        System.out.println("Archivo destino: " + file);
+    }
+    System.out.println("Transmission ID: " + txid);
+    if (isFullTransmissionId) {
+        System.out.println("Modo busqueda.: EXACTO (sin auto-incremento)");
+    } else {
+        System.out.println("Fecha (--date): " + date);
+        System.out.println("Modo busqueda.: AUTO-INCREMENTO (hasta 99)");
+    }
+    System.out.println("MIP Host......: " + ip + ":" + port);
+    if (DEBUG) {
+        System.out.println("Modo DEBUG....: ACTIVADO");
+    }
+    System.out.println("=================================================");
+
+    // Extraer el numero de secuencia actual del Transmission ID
+    int currentSeq = Integer.parseInt(txid.substring(12, 14));
+    
+    // Si es Transmission ID completo, solo intentar UNA VEZ (sin auto-incremento)
+    int maxAttemptsForThisRun = isFullTransmissionId ? currentSeq : maxAttempts;
+
+    // Variables para control de busqueda
+    boolean found = false;
+    String lastError = null;
+    String lastResponseCode = "9989999"; // Último código de error capturado
+    String successfulTxid = null;
+
+    // Intentar desde currentSeq hasta maxAttemptsForThisRun
+    for (int seq = currentSeq; seq <= maxAttemptsForThisRun && !found; seq++) {
+        String tryTxid = txid.substring(0, 12) + String.format("%02d", seq);
+        
+        if (isFullTransmissionId) {
+            System.out.println("\n[BUSQUEDA EXACTA] Intentando: " + tryTxid);
+        } else {
+            System.out.println("\n[BUSQUEDA] Intentando con secuencia " + seq + ": " + tryTxid);
+        }
+
+        Socket sock = null;
+        
+        try {
+            // Establecer conexion TCP con el MIP
+            sock = new Socket();
+            try {
+                sock.connect(new InetSocketAddress(ip, port), TIMEOUT);
+                sock.setSoTimeout(TIMEOUT);
+            } catch (SocketTimeoutException e) {
+                // TIMEOUT - No tiene sentido seguir intentando
+                lastResponseCode = "9989995"; // Error de timeout específico
+                lastError = "Timeout en conexion: " + e.getMessage();
+                System.err.println("ERROR: TIMEOUT detectado - Abortando busqueda");
+                throw new MipException(
+                    "Timeout al conectar con MIP: " + ip + ":" + port,
+                    lastResponseCode
+                );
+            } catch (IOException e) {
+                lastResponseCode = "9989997"; // Error de conexión específico
+                lastError = "Fallo conexion: " + e.getMessage();
+                
+                // Si es Transmission ID completo, abortar inmediatamente
+                if (isFullTransmissionId) {
+                    throw new MipException(
+                        "Error de conexion con Transmission ID exacto: " + lastError,
+                        lastResponseCode
+                    );
+                }
+                continue; // Intentar siguiente secuencia
+            }
+
+            InputStream in = sock.getInputStream();
+            OutputStream out = sock.getOutputStream();
+
+            // PASO 1: Enviar Request 101 "From Mastercard"
+            System.out.println("[1/5] Enviando Request 1 10101 " + tryTxid);
+            byte[] req101 = buildRequest101(tryTxid);
+            writeFramed(out, req101);
+
+            // PASO 2: Recibir Header 004 con informacion del archivo
+            System.out.println("[2/5] Recibiendo Response...");
+            Frame hdr = null;
+            try {
+                hdr = readFramed(in);
+            } catch (SocketTimeoutException e) {
+                // TIMEOUT - No tiene sentido seguir intentando
+                lastResponseCode = "9989995";
+                lastError = "Timeout esperando respuesta del MIP";
+                System.err.println("ERROR: TIMEOUT detectado - Abortando busqueda");
+                throw new MipException(
+                    "Timeout esperando respuesta del MIP",
+                    lastResponseCode
+                );
+            }
+            
+            if (DEBUG) {
+                System.out.println("  [DEBUG] Response: " + hdr.asEbcdic(0, hdr.data.length));
+            }
+
+            // Validar que sea Header 004
+            String code = hdr.asEbcdic(0, 3);
+
+            // Si recibimos un mensaje de error (998 con rc != 00)
+            if ("998".equals(code)) {
+                String rc = hdr.asEbcdic(5, 2);
+                if (!"00".equals(rc)) {
+                    // Error - archivo no encontrado o no disponible
+                    String errorMsg = "Archivo no disponible (rc=" + rc + ")";
+                    if (hdr.data.length > 7) {
+                        try {
+                            String detail = hdr.asEbcdic(7, hdr.data.length - 7);
+                            if (!detail.isEmpty()) {
+                                errorMsg += " - " + detail.trim();
+                            }
+                        } catch (Exception ignore) {}
+                    }
+                    lastError = errorMsg;
+                    
+                    // Capturar el código completo de respuesta (7 bytes: "998" + "XX" + más info)
+                    lastResponseCode = hdr.asEbcdic(0, Math.min(7, hdr.data.length));
+                    
+                    // Si es Transmission ID completo, abortar inmediatamente
+                    if (isFullTransmissionId) {
+                        throw new MipException(
+                            "Archivo no encontrado con Transmission ID exacto: " + tryTxid + " - " + errorMsg,
+                            lastResponseCode
+                        );
+                    }
+                    
+                    continue; // Intentar con siguiente secuencia
+                }
+            }
+
+            if (!"004".equals(code)) {
+                lastError = "Respuesta inesperada del MIP: " + code;
+                lastResponseCode = "9989998"; // Respuesta inesperada
+                
+                // Si es Transmission ID completo, abortar inmediatamente
+                if (isFullTransmissionId) {
+                    throw new MipException(
+                        "Respuesta inesperada del MIP: " + code,
+                        lastResponseCode
+                    );
+                }
+                
+                continue;
+            }
+
+            // Archivo encontrado
+            found = true;
+            successfulTxid = tryTxid;
+
+            System.out.println("  ENCONTRADO con secuencia " + seq);
+
+            // Extraer informacion del header
+            String rxTxid = hdr.asEbcdic(5, 14);
+            int expectedBlocks = hdr.asInt(36, 4);
+
+            // Si se usa nombre automatico, generar nombre basado en Header decodificado
+            if (useAutoNaming) {
+                finalFilePath = rxTxid + ".EBCDIC";
+                System.out.println("  Nombre generado: " + finalFilePath);
+            }
+
+            System.out.println("  Archivo......: " + rxTxid);
+            System.out.println("  Bloques......: " + expectedBlocks);
+
+            // PASO 3: Recibir bloques de datos con Direction Indicator 'T' (pag.53)
+            System.out.println("[3/5] Recibiendo bloques de datos...");
+            FileOutputStream fos = new FileOutputStream(finalFilePath);
+            int blocksReceived = 0;
+
+            try {
+                while (true) {
+                    Frame dataFrame = null;
+                    try {
+                        dataFrame = readFramed(in);
+                    } catch (SocketTimeoutException e) {
+                        // TIMEOUT durante recepción de bloques
+                        throw new MipException(
+                            "Timeout recibiendo bloques de datos (bloque " + (blocksReceived + 1) + ")",
+                            "9989995"
+                        );
+                    }
+
+                    if (DEBUG) {
+                        System.out.println("  DEBUG: Frame recibido, size=" + dataFrame.data.length);
+                        System.out.println("  DEBUG: Primeros bytes: " + dataFrame.asEbcdic(0, Math.min(20, dataFrame.data.length)));
+                    }
+
+                    // Verificar si es un bloque de datos o el trailer
+                    String firstBytes = dataFrame.asEbcdic(0, 3);
+                    if ("998".equals(firstBytes)) {
+                        // Es el trailer, salir del loop
+                        System.out.println("  Total bloques recibidos: " + blocksReceived);
+
+                        // Validar el trailer - puede lanzar MipException
+                        try {
+                            checkMcResponse("Bloques+Trailer: ", dataFrame);
+                        } catch (Exception e) {
+                            // Si checkMcResponse lanza excepción con código MC, propagarla como MipException
+                            if (e.getMessage() != null && e.getMessage().startsWith("998")) {
+                                String mcCode = e.getMessage().substring(0, Math.min(7, e.getMessage().length()));
+                                throw new MipException(e.getMessage(), mcCode);
+                            }
+                            throw new MipException(e.getMessage(), "9989996");
+                        }
+
+                        // Validar conteo de bloques
+                        int trailerCount = dataFrame.asInt(7, 4);
+                        int expectedCount = blocksReceived + 1; // bloques + trailer
+
+                        if (trailerCount != expectedCount) {
+                            System.err.println("ADVERTENCIA: Discrepancia en conteo");
+                            System.err.println("  Esperado: " + expectedCount);
+                            System.err.println("  Recibido: " + trailerCount);
+                        }
+
+                        System.out.println("  Trailer 998 OK - Count: " + trailerCount);
+                        break;
+                    }
+
+                    // Es un bloque de datos
+                    int dataStart = 0;
+
+                    if (dataFrame.data.length >= 5) {
+                        // Intentar detectar RDW (4 bytes Big-Endian con longitud razonable)
+                        int possibleRdw = ((dataFrame.data[0] & 0xFF) << 24) |
+                                        ((dataFrame.data[1] & 0xFF) << 16) |
+                                        ((dataFrame.data[2] & 0xFF) << 8) |
+                                        (dataFrame.data[3] & 0xFF);
+
+                        // Si es un RDW valido (positivo y menor que frame size)
+                        if (possibleRdw > 0 && possibleRdw < dataFrame.data.length - 4) {
+                            dataStart = 4;
+                            if (DEBUG) {
+                                System.out.println("  DEBUG: Detectado RDW de " + possibleRdw + " bytes, ajustando offset");
+                            }
+                        }
+                    }
+
+                    // Verificar Direction Indicator en posicion ajustada
+                    int dirIndicatorUnsigned = dataFrame.data[dataStart] & 0xFF;
+
+                    if (DEBUG) {
+                        System.out.println("  DEBUG: Direction Indicator en pos " + dataStart + ": 0x" + String.format("%02X", dirIndicatorUnsigned));
+                    }
+
+                    // 0xE3 es 'T' en EBCDIC
+                    if (dirIndicatorUnsigned != 0xE3) {
+                        // Intentar detectar si hay padding 0xFF antes del Direction Indicator
+                        if (dirIndicatorUnsigned == 0xFF && dataStart + 1 < dataFrame.data.length) {
+                            int nextByte = dataFrame.data[dataStart + 1] & 0xFF;
+                            if (nextByte == 0xE3) {
+                                // Encontrado: 0xFF seguido de 0xE3 ('T')
+                                dataStart++; // Saltar el 0xFF
+                                dirIndicatorUnsigned = nextByte;
+                                if (DEBUG) {
+                                    System.out.println("  DEBUG: Detectado padding 0xFF, ajustando a pos " + dataStart);
+                                }
+                            }
+                        }
+                    }
+
+                    // Si aun no es 0xE3, mostrar advertencia
+                    if (dirIndicatorUnsigned != 0xE3) {
+                        System.err.println("ADVERTENCIA: Direction Indicator esperado 'T' (0xE3), recibi: 0x" + String.format("%02X", dirIndicatorUnsigned));
+                        if (DEBUG) {
+                            System.err.println("  DEBUG: Contexto (20 bytes): " + 
+                                hexBytes(dataFrame.data, 0, Math.min(20, dataFrame.data.length)));
+                        }
+                    }
+
+                    // Escribir datos al archivo (desde dataStart + 1, saltando Direction Indicator)
+                    int payloadStart = dataStart + 1;
+                    int payloadLength = dataFrame.data.length - payloadStart;
+
+                    if (payloadLength > 0) {
+                        fos.write(dataFrame.data, payloadStart, payloadLength);
+                    }
+
+                    blocksReceived++;
+
+                    if (blocksReceived % 10 == 0) {
+                        System.out.println("  Bloques recibidos: " + blocksReceived);
+                    }
+                }
+            } finally {
+                try { fos.close(); } catch (Exception ignore) {}
+            }
+
+            // PASO 4: Enviar Purge 999 (omitido)
+            System.out.println("[4/5] Enviando Purge 999... (omitido)");
+
+            // PASO 5: Recibir rpta del Purge (omitido)
+            System.out.println("[5/5] Recibiendo rpta de Purge...(omitido)");
+
+            File savedFile = new File(finalFilePath);
+            System.out.println("\n=================================================");
+            System.out.println("RECEPCION COMPLETADA EXITOSAMENTE");
+            System.out.println("Archivo guardado: " + savedFile.getAbsolutePath());
+            System.out.println("Tamano.........: " + savedFile.length() + " bytes");
+            System.out.println("Bloques recibidos: " + blocksReceived);
+            if (seq > currentSeq && !isFullTransmissionId) {
+                System.out.println("Secuencia usada : " + seq + " (inicial: " + currentSeq + ")");
+            }
+            if (useAutoNaming) {
+                System.out.println("Nombre generado : " + savedFile.getName());
+            }
+            System.out.println("=================================================");
+
+            // Retornar resultado exitoso
+            return new MipTransferResult(successfulTxid, "9980100");
+
+        } catch (MipException e) {
+            // MipException ya tiene el código de error, simplemente propagarla hacia arriba
+            throw e;
+            
+        } catch (Exception e) {
+            // Cualquier otra excepción durante el proceso
+            String errorMsg = e.getMessage() != null ? e.getMessage() : e.getClass().getSimpleName();
+            
+            // Si es una excepción de checkMcResponse embebida, extraer el código
+            if (errorMsg.startsWith("998")) {
+                String mcCode = errorMsg.substring(0, Math.min(7, errorMsg.length()));
+                lastResponseCode = mcCode;
+                lastError = errorMsg;
+            } else {
+                lastResponseCode = "9989999"; // Error genérico
+                lastError = errorMsg;
+            }
+            
+            // Si es Transmission ID completo o último intento, lanzar MipException
+            if (isFullTransmissionId || seq == maxAttemptsForThisRun) {
+                throw new MipException(
+                    "Error en receiveFromMip: " + errorMsg,
+                    lastResponseCode
+                );
+            }
+            
+            // Sino, continuar con siguiente secuencia
+            continue;
+            
+        } finally {
+            try { if (sock != null) sock.close(); } catch (Exception ignore) {}
+        }
+    }
+
+    // Si no se encontro archivo despues de intentar todas las secuencias
+    System.err.println("\n=================================================");
+    System.err.println("ERROR: NO SE ENCONTRO ARCHIVO DISPONIBLE");
+    System.err.println("=================================================");
+    System.err.println("Transmission ID base: " + txid.substring(0, 12));
+    if (isFullTransmissionId) {
+        System.err.println("Modo busqueda : EXACTO (sin auto-incremento)");
+        System.err.println("Transmission ID: " + txid);
+    } else {
+        System.err.println("Secuencias buscadas : " + currentSeq + " a " + maxAttemptsForThisRun);
+    }
+    if (lastError != null) {
+        System.err.println("Ultimo error del MIP: " + lastError);
+    }
+    System.err.println("Codigo de respuesta: " + lastResponseCode);
+    System.err.println("=================================================");
+    
+    // Lanzar excepción personalizada con código de error
+    throw new MipException(
+        "No se encontro archivo disponible con Transmission ID " + 
+        (isFullTransmissionId ? txid : txid.substring(0, 12)) +
+        (isFullTransmissionId ? "" : " (Secuencias: " + currentSeq + " a " + maxAttemptsForThisRun + ")") +
+        (lastError != null ? " - Ultimo error: " + lastError : ""),
+        lastResponseCode
+    );
+}
+
