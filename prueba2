@@ -1,12 +1,235 @@
 /**
- * Excepción personalizada que incluye código de respuesta MIP
+ * OPERACION SEND: Envia archivo IPM hacia MIP (TO Mastercard)
+ * 
+ * Implementa protocolo estandar del manual (Header 004 -> Data 'R' -> Trailer 998).
+ * LOGICA DE TRANSMISSION ID:
+ * 1. Modo Explicito (ID 14 chars): Se intenta UNA vez. Si falla (red o rechazo), error fatal.
+ * 2. Modo Dinamico (ID corto): Hace busqueda de secuencia valida (01..99).
+ * 
+ * @return MipTransferResult con transmissionId y responseCode
+ * @throws MipException con código de error específico
  */
-public static class MipException extends Exception {
-    public String responseCode;
+public static MipTransferResult sendToMip(String ip, int port, String file, String ipmName) 
+        throws Exception {
     
-    public MipException(String message, String responseCode) {
-        super(message);
-        this.responseCode = responseCode;
+    File f = new File(file);
+    if (!f.exists() || !f.isFile()) {
+        throw new FileNotFoundException("No existe el archivo: " + f.getAbsolutePath());
     }
-}
 
+    // Determinar si ipmName ya es un Transmission ID completo (14 caracteres)
+    boolean isExplicitId = (ipmName != null && ipmName.length() == 14);
+    
+    System.out.println("=================================================");
+    System.out.println("INICIA PROCESO DE ENVIO (TO MASTERCARD)");
+    System.out.println("=================================================");
+    System.out.println("Archivo IPM.....: " + f.getAbsolutePath());
+    System.out.println("Tamano..........: " + f.length() + " bytes");
+    System.out.println("MIP Host........: " + ip + ":" + port);
+    if (isExplicitId) {
+        System.out.println("Transmission ID.: " + ipmName + " (MODO EXACTO)");
+        System.out.println("Modo busqueda...: EXPLICITO (sin auto-incremento)");
+    } else {
+        System.out.println("Base ID.........: " + ipmName);
+        System.out.println("Modo busqueda...: DINAMICO (slots libres)");
+    }
+    System.out.println("=================================================");
+
+    // FASE 1: Se consulta Transmission ID valido (Bucle de intentos)
+    for (int seq = 1; seq <= maxAttempts; seq++) {
+        String currentTxId;
+        
+        if (isExplicitId) {
+            currentTxId = ipmName; // Usa Transmission ID exacto
+        } else {
+            // Normalizar Transmission ID a 14 caracteres (usa fecha actual + secuencia)
+            String suffix = String.format("%02d", seq);
+            currentTxId = normalizeTransmissionId(ipmName, suffix, customDate: null);
+        }
+
+        if (isExplicitId) {
+            System.out.println("\n[Intento " + seq + "] Probando ID: " + currentTxId);
+        } else {
+            System.out.println("Enviando ID: " + currentTxId);
+        }
+
+        Socket sock = null;
+        InputStream in = null;
+        OutputStream out = null;
+        String finalTxId = null;
+        boolean headerAccepted = false;
+
+        try {
+            // Establecer conexion TCP con el MIP
+            sock = new Socket();
+            try {
+                sock.connect(new InetSocketAddress(ip, port), TIMEOUT);
+                sock.setSoTimeout(TIMEOUT);
+                in = sock.getInputStream();
+                out = sock.getOutputStream();
+            } catch (SocketTimeoutException ste) {
+                // TIMEOUT - Abortar todo
+                throw new MipException(
+                    "Error critico de red: Timeout al conectar con MIP " + ste,
+                    "9989995"
+                );
+            } catch (ConnectException ce) {
+                // Error de conexión
+                throw new MipException(
+                    "Error critico de red: No se pudo conectar al MIP " + ce,
+                    "9989997"
+                );
+            }
+
+            // PASO 1: Enviar Header 004 "To Mastercard" (pag. 49)
+            byte[] hdr004 = buildHeader004(currentTxId);
+            writeFramed(out, hdr004);
+
+            Frame r = null;
+            try {
+                r = readFramed(in);
+            } catch (SocketTimeoutException ste) {
+                // TIMEOUT esperando confirmación
+                throw new MipException(
+                    "Timeout esperando confirmacion del Header",
+                    "9989995"
+                );
+            }
+            
+            try {
+                checkMcResponse(stage: "Confirmacion Header: ", r); // Si esto falla, lanza Exception
+            } catch (Exception e) {
+                // Si checkMcResponse lanza excepción con código MC, convertirla a MipException
+                if (e.getMessage() != null && e.getMessage().startsWith("998")) {
+                    String mcCode = e.getMessage().substring(0, Math.min(7, e.getMessage().length()));
+                    
+                    // Si es modo explícito, abortar inmediatamente
+                    if (isExplicitId) {
+                        throw new MipException(
+                            "Header rechazado con ID exacto: " + e.getMessage(),
+                            mcCode
+                        );
+                    }
+                    
+                    // En modo dinámico, continuar con siguiente secuencia
+                    System.out.println("\nFALLO :" + e.getMessage());
+                    continue;
+                }
+                
+                // Otro tipo de error
+                if (isExplicitId) {
+                    throw new MipException(
+                        "Error en confirmacion de Header: " + e.getMessage(),
+                        "9989996"
+                    );
+                }
+                
+                continue;
+            }
+
+            // Si llegamos aqui, todo OK
+            System.out.println(x: "Transmission ID aceptado");
+            headerAccepted = true;
+            finalTxId = currentTxId;
+            break; // Salimos del for y seguimos con los datos
+
+        } catch (SocketTimeoutException ste) {
+            // TIMEOUT - Error crítico, abortar
+            try { sock.close(); } catch (Exception ignore) {}
+            throw new MipException(
+                "Error critico de red: Timeout al conectar con MIP " + ste,
+                "9989995"
+            );
+            
+        } catch (ConnectException ce) {
+            // Error de conexión rechazada
+            try { sock.close(); } catch (Exception ignore) {}
+            throw new MipException(
+                "Error critico de red: No se pudo conectar al MIP " + ce,
+                "9989997"
+            );
+            
+        } catch (Exception e) {
+            // Aqui caen los errores logicos (Archivo duplicado, etc)
+            System.out.println("\nFALLO :" + e.getMessage());
+            try { sock.close(); } catch (Exception ignore) {}
+
+            // Si es modo explicito, abortar
+            if (isExplicitId) throw e;
+
+            // Si es el ultimo intento dinamico, abortar
+            if (seq == maxAttempts) throw new Exception(message: "Se agotaron los intentos de envio.");
+
+            // Si no, CONTINUA el bucle buscando el siguiente slot libre...
+        }
+    }
+
+    if (!headerAccepted) {
+        throw new MipException(
+            "No se pudo iniciar sesion de envio.",
+            "9989999"
+        );
+    }
+
+    try {
+        // PASO 2: Enviar bloques de datos con Direction Indicator 'R'
+        System.out.println(x: "[2/3] Enviando bloques de datos...");
+        int blocks = 0;
+        FileInputStream fis = new FileInputStream(f);
+        try {
+            byte[] buf = new byte[DATA_CHUNK - 1]; // Se resta 1 porque luego se añade 'R' como prefijo y respetar DATA_CHUNK
+            int n;
+            while ((n = fis.read(buf)) >= 0) {
+                if (n == 0) break;
+                // Construir registro de datos: 'R' + payload
+                ByteArrayOutputStream rec = new ByteArrayOutputStream(1 + n);
+                rec.write(ebcdicByte(c: 'R')); // Direction Indicator: TO Mastercard
+                rec.write(buf, off: 0, n); // Datos del archivo IPM
+                writeFramed(out, rec.toByteArray());
+                blocks++;
+                System.out.println("  Bloque #" + blocks + " enviado | Tamano: " + rec.toByteArray().length + " bytes");
+            }
+        } finally {
+            try { fis.close(); } catch (Exception ignore) {}
+        }
+
+        System.out.println("  Total bloques de datos: " + blocks);
+
+        // PASO 3: Enviar Trailer 998
+        System.out.println(x: "[3/3] Enviando Trailer...");
+        byte[] tr998 = buildTrailer998(blocks);
+        writeFramed(out, tr998);
+
+        Frame r = null;
+        try {
+            r = readFramed(in);
+        } catch (SocketTimeoutException ste) {
+            throw new MipException(
+                "Timeout esperando confirmacion del Trailer",
+                "9989995"
+            );
+        }
+        
+        try {
+            checkMcResponse(stage: "Bloques+Trailer: ", r);
+        } catch (Exception e) {
+            // Si checkMcResponse lanza excepción con código MC, convertirla a MipException
+            if (e.getMessage() != null && e.getMessage().startsWith("998")) {
+                String mcCode = e.getMessage().substring(0, Math.min(7, e.getMessage().length()));
+                throw new MipException(e.getMessage(), mcCode);
+            }
+            throw new MipException(e.getMessage(), "9989996");
+        }
+
+        System.out.println("\n=================================================");
+        System.out.println("ENVIO COMPLETADO EXITOSAMENTE");
+        System.out.println("ID utilizado....: " + finalTxId);
+        System.out.println("Bloques totales.: " + (blocks + 1) + " (incluye trailer)");
+        System.out.println("=================================================");
+
+    } finally {
+        try { sock.close(); } catch (Exception ignore) {}
+    }
+
+    return new MipTransferResult(finalTxId, "9980100");
+}
