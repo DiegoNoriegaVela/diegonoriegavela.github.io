@@ -224,31 +224,21 @@ public class MipManager {
         
         // Verificar si se usa modo "auto"
         if ("auto".equalsIgnoreCase(p.file)) {
-            // Usar configuracion autoNameReceive del INI
-            if (cfg.autoNameReceive) {
-                // Generar nombre basado en transmission ID
-                finalDestinationPath = result.transmissionId;
-                
-                // Agregar extension segun el modo de codificacion
-                if ("ASCII".equalsIgnoreCase(p.encode)) {
-                    finalDestinationPath += ".txt";
-                } else if ("EBCDIC".equalsIgnoreCase(p.encode)) {
-                    finalDestinationPath += ".ipm";
-                }
-                
-                System.out.println("Modo AUTO: Nombre generado automaticamente: " + finalDestinationPath);
-            } else {
-                // Si autoNameReceive=false, usar nombre por defecto
-                finalDestinationPath = "received_" + result.transmissionId;
-                
-                if ("ASCII".equalsIgnoreCase(p.encode)) {
-                    finalDestinationPath += ".txt";
-                } else {
-                    finalDestinationPath += ".ipm";
-                }
-                
-                System.out.println("Modo AUTO: Nombre por defecto: " + finalDestinationPath);
+            // Validar que existe configuración autoNameReceive
+            if (cfg.autoNameReceive == null || cfg.autoNameReceive.trim().isEmpty()) {
+                throw new IllegalArgumentException(
+                    "Modo 'auto' requiere la configuracion 'autoNameReceive' en mipmanager.ini");
             }
+            
+            // Resolver el patron del autoNameReceive
+            finalDestinationPath = resolveAutoNamePattern(
+                cfg.autoNameReceive, 
+                result.transmissionId, 
+                p.date,
+                p.encode
+            );
+            
+            System.out.println("Modo AUTO: Nombre generado: " + finalDestinationPath);
         } else {
             // Usar el path especificado por el usuario
             finalDestinationPath = p.file;
@@ -394,6 +384,60 @@ public class MipManager {
     }
 
     /* ========================================================================
+     * AUTO-NAMING - Resolucion de patron autoNameReceive
+     * ======================================================================== */
+
+    /**
+     * Resuelve el patron autoNameReceive del INI
+     * 
+     * Patron: /WC_MC/MIP/TXXX-AAAAMMDD-Archivo de Cambio Confirmacion
+     * 
+     * Variables soportadas:
+     * - TXXX: Primeros 4 caracteres del transmissionId (ej: T120)
+     * - AAAAMMDD: Fecha del parametro --date (ej: 20251103)
+     * 
+     * @param pattern Patron del INI
+     * @param transmissionId Transmission ID recibido (ej: T1200284001601)
+     * @param date Fecha en formato YYYYMMDD
+     * @param encode Formato ASCII o EBCDIC
+     * @return Path completo resuelto
+     */
+    private static String resolveAutoNamePattern(String pattern, String transmissionId, 
+            String date, String encode) {
+        
+        String result = pattern;
+        
+        // Extraer primeros 4 caracteres del transmission ID
+        String firstFour = transmissionId.length() >= 4 ? 
+            transmissionId.substring(0, 4) : transmissionId;
+        
+        // Reemplazar TXXX con primeros 4 caracteres
+        result = result.replace("TXXX", firstFour);
+        
+        // Reemplazar AAAAMMDD con la fecha
+        result = result.replace("AAAAMMDD", date);
+        
+        // Agregar extension segun codificacion (opcional)
+        // Si el patron NO tiene extension, agregarla
+        if (!result.contains(".")) {
+            if ("ASCII".equalsIgnoreCase(encode)) {
+                result += ".txt";
+            } else if ("EBCDIC".equalsIgnoreCase(encode)) {
+                result += ".ipm";
+            }
+        }
+        
+        if (DEBUG) {
+            System.out.println("DEBUG: Patron original: " + pattern);
+            System.out.println("DEBUG: TXXX -> " + firstFour);
+            System.out.println("DEBUG: AAAAMMDD -> " + date);
+            System.out.println("DEBUG: Resultado: " + result);
+        }
+        
+        return result;
+    }
+
+    /* ========================================================================
      * LOGGING - Registro de eventos en el log del MIP
      * ======================================================================== */
 
@@ -525,9 +569,14 @@ public class MipManager {
         System.out.println("PARAMETROS OPCIONALES:");
         System.out.println("  --date <YYYYMMDD>       Fecha (OBLIGATORIO para receive)");
         System.out.println();
-        System.out.println("CONFIGURACION:");
-        System.out.println("  El archivo mipmanager.ini debe estar junto al JAR");
-        System.out.println("  autoNameReceive=true    Genera nombre automatico en modo auto");
+        System.out.println("CONFIGURACION (mipmanager.ini):");
+        System.out.println("  [GENERAL]");
+        System.out.println("  miplog=/path/to/mip.log");
+        System.out.println("  autoNameReceive=/WC_MC/MIP/TXXX-AAAAMMDD-Archivo");
+        System.out.println();
+        System.out.println("  Patron autoNameReceive:");
+        System.out.println("    TXXX       - Reemplazado por primeros 4 chars del transmission ID");
+        System.out.println("    AAAAMMDD   - Reemplazado por fecha --date");
         System.out.println();
         System.out.println("EJEMPLOS:");
         System.out.println();
@@ -535,9 +584,10 @@ public class MipManager {
         System.out.println("  java -jar mipmgr-1.0.0.jar --mode send --ip 10.0.0.1 --port 5000 \\");
         System.out.println("       --file datos.txt --encode ASCII --ipmname R11902840");
         System.out.println();
-        System.out.println("  # Recibir con nombre automatico");
+        System.out.println("  # Recibir con nombre automatico (usa patron del INI)");
         System.out.println("  java -jar mipmgr-1.0.0.jar --mode receive --ip 10.0.0.1 --port 5000 \\");
         System.out.println("       --file auto --encode ASCII --ipmname T112 --date 20260116");
+        System.out.println("  Resultado: /WC_MC/MIP/T112-20260116-Archivo.txt");
         System.out.println();
         System.out.println("  # Recibir con nombre especifico");
         System.out.println("  java -jar mipmgr-1.0.0.jar --mode receive --ip 10.0.0.1 --port 5000 \\");
