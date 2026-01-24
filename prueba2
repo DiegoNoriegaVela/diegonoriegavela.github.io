@@ -1,158 +1,152 @@
 /* ========================================================================
- * OPCION 1: ENVIAR ARCHIVO A MIP
+ * AUTO-NAMING - Resolucion de patron autoNameReceive
  * ======================================================================== */
 
-private static void interactiveSend(MipConfig cfg) throws Exception {
-    System.out.println("\n=== ENVIAR ARCHIVO A MIP ===");
-    System.out.println();
-
-    // IP
-    System.out.print("IP del MIP: ");
-    String ip = scanner.nextLine().trim();
-
-    // Puerto
-    System.out.print("Puerto del MIP: ");
-    int port = Integer.parseInt(scanner.nextLine().trim());
-
-    // Archivo
-    System.out.print("Archivo a enviar (ruta): ");
-    String file = scanner.nextLine().trim();
-
-    File sourceFile = new File(file);
-    if (!sourceFile.exists()) {
-        throw new FileNotFoundException("Archivo no encontrado: " + file);
-    }
-
-    // IPM Name
-    System.out.print("IPM Name (9 chars: R11902840 o 14 chars completo): ");
-    String ipmName = scanner.nextLine().trim();
-
-    // Validar longitud
-    if (ipmName.length() != 9 && ipmName.length() != 14) {
-        throw new IllegalArgumentException("IPM Name debe tener 9 o 14 caracteres");
-    }
-
-    // Fecha - Solo si es de 9 caracteres
-    String date = null;
-    if (ipmName.length() == 9) {
-        System.out.print("Fecha (YYYYMMDD, Ej: 20260116): ");
-        date = scanner.nextLine().trim();
-        if (!date.matches("\\d{8}")) {
-            throw new IllegalArgumentException("Formato de fecha invalido. Use YYYYMMDD");
+/**
+ * Resuelve el patron autoNameReceive del INI
+ * 
+ * Patron: /WC_MC/MIP/TXXX-AAAAMMDD-Archivo de Cambio Confirmacion
+ * 
+ * Variables soportadas:
+ * - TXXX: Primeros 4 caracteres del transmissionId (ej: T120)
+ * - AAAAMMDD: Fecha del parametro --date o extraida del transmission ID
+ * 
+ * @param pattern Patron del INI
+ * @param transmissionId Transmission ID recibido (ej: T1200284001601)
+ * @param date Fecha en formato YYYYMMDD (puede ser null si ID es de 14 chars)
+ * @param encode Formato ASCII o EBCDIC
+ * @return Path completo resuelto
+ */
+private static String resolveAutoNamePattern(String pattern, String transmissionId, 
+        String date, String encode) {
+    
+    String result = pattern;
+    
+    // Extraer primeros 4 caracteres del transmission ID
+    String firstFour = transmissionId.length() >= 4 ? 
+        transmissionId.substring(0, 4) : transmissionId;
+    
+    // Reemplazar TXXX con primeros 4 caracteres
+    result = result.replace("TXXX", firstFour);
+    
+    // Determinar la fecha a usar
+    String dateToUse;
+    
+    if (date != null && date.matches("\\d{8}")) {
+        // Usar fecha proporcionada
+        dateToUse = date;
+        if (DEBUG || interactiveDebug) {
+            System.out.println("DEBUG: Usando fecha proporcionada: " + date);
+        }
+    } else if (transmissionId.length() == 14) {
+        // Extraer fecha juliana del transmission ID y convertir a YYYYMMDD
+        // Formato: rTTIIEEEEEJJJSS
+        // Posiciones: 0123456789012 13
+        // EEEEE = YYJJJ (2 digitos año + 3 digitos dia juliano)
+        try {
+            String yearAndJulian = transmissionId.substring(5, 10); // YYJJJ
+            int yy = Integer.parseInt(yearAndJulian.substring(0, 2)); // YY
+            int julianDay = Integer.parseInt(yearAndJulian.substring(2, 5)); // JJJ
+            
+            // Construir año completo (asumiendo 20YY para el siglo actual)
+            int year = 2000 + yy;
+            
+            // Convertir dia juliano a fecha calendario
+            dateToUse = julianDayToDate(year, julianDay);
+            
+            if (DEBUG || interactiveDebug) {
+                System.out.println("DEBUG: Fecha extraida del transmission ID:");
+                System.out.println("DEBUG:   YY = " + yy + ", JJJ = " + julianDay);
+                System.out.println("DEBUG:   Año = " + year + ", Dia juliano = " + julianDay);
+                System.out.println("DEBUG:   Fecha convertida: " + dateToUse);
+            }
+            
+        } catch (Exception e) {
+            // Si falla la extraccion, usar fecha actual
+            SimpleDateFormat sdf = new SimpleDateFormat("yyyyMMdd");
+            dateToUse = sdf.format(new Date());
+            
+            if (DEBUG || interactiveDebug) {
+                System.out.println("DEBUG: Error extrayendo fecha del ID, usando fecha actual: " + dateToUse);
+            }
         }
     } else {
-        System.out.println("  (Fecha no necesaria - ID completo detectado)");
+        // Usar fecha actual como fallback
+        SimpleDateFormat sdf = new SimpleDateFormat("yyyyMMdd");
+        dateToUse = sdf.format(new Date());
+        
+        if (DEBUG || interactiveDebug) {
+            System.out.println("DEBUG: Usando fecha actual: " + dateToUse);
+        }
     }
-
-    // Encode
-    System.out.println("Formato del archivo:");
-    System.out.println("  (1) ASCII - Requiere conversion a IPM");
-    System.out.println("  (2) EBCDIC - Archivo IPM ya construido");
-    System.out.print("Seleccione: ");
-    String encodeOption = scanner.nextLine().trim();
-    String encode = "1".equals(encodeOption) ? "ASCII" : "EBCDIC";
-
-    // Debug
-    System.out.print("Activar modo debug? (S/N): ");
-    String debugOption = scanner.nextLine().trim();
-    interactiveDebug = "S".equalsIgnoreCase(debugOption);
-
-    // Ejecutar envio
-    System.out.println("\n--- Iniciando envio ---");
-    MipParams p = new MipParams();
-    p.mode = "send";
-    p.ip = ip;
-    p.port = port;
-    p.file = file;
-    p.ipmName = ipmName;
-    p.encode = encode;
-    p.date = date;
-
-    runSendMode(p, cfg);
     
-    System.out.println("\nPresione ENTER para continuar...");
-    scanner.nextLine();
+    // Reemplazar AAAAMMDD con la fecha determinada
+    result = result.replace("AAAAMMDD", dateToUse);
+    
+    // Agregar extension segun codificacion (opcional)
+    // Si el patron NO tiene extension, agregarla
+    if (!result.contains(".")) {
+        if ("ASCII".equalsIgnoreCase(encode)) {
+            result += ".txt";
+        } else if ("EBCDIC".equalsIgnoreCase(encode)) {
+            result += ".ipm";
+        }
+    }
+    
+    if (DEBUG || interactiveDebug) {
+        System.out.println("DEBUG: Patron original: " + pattern);
+        System.out.println("DEBUG: TXXX -> " + firstFour);
+        System.out.println("DEBUG: AAAAMMDD -> " + dateToUse);
+        System.out.println("DEBUG: Resultado: " + result);
+    }
+    
+    return result;
 }
 
-/* ========================================================================
- * OPCION 2: SOLICITAR ARCHIVO DE MIP
- * ======================================================================== */
-
-private static void interactiveReceive(MipConfig cfg) throws Exception {
-    System.out.println("\n=== SOLICITAR ARCHIVO DE MIP ===");
-    System.out.println();
-
-    // IP
-    System.out.print("IP del MIP: ");
-    String ip = scanner.nextLine().trim();
-
-    // Puerto
-    System.out.print("Puerto del MIP: ");
-    int port = Integer.parseInt(scanner.nextLine().trim());
-
-    // IPM Name
-    System.out.print("IPM Name (9 chars: T112 o 14 chars completo): ");
-    String ipmName = scanner.nextLine().trim();
-
-    // Validar longitud
-    if (ipmName.length() != 9 && ipmName.length() != 14) {
-        throw new IllegalArgumentException("IPM Name debe tener 9 o 14 caracteres");
+/**
+ * Convierte dia juliano a fecha en formato YYYYMMDD
+ * 
+ * @param year Año completo (ej: 2026)
+ * @param julianDay Dia del año (1-366)
+ * @return Fecha en formato YYYYMMDD
+ */
+private static String julianDayToDate(int year, int julianDay) {
+    // Validar dia juliano
+    if (julianDay < 1 || julianDay > 366) {
+        throw new IllegalArgumentException("Dia juliano invalido: " + julianDay);
     }
-
-    // Fecha - Solo si es de 9 caracteres
-    String date;
-    if (ipmName.length() == 9) {
-        System.out.print("Fecha (YYYYMMDD, Ej: 20260116): ");
-        date = scanner.nextLine().trim();
-        if (!date.matches("\\d{8}")) {
-            throw new IllegalArgumentException("Formato de fecha invalido. Use YYYYMMDD");
-        }
-    } else {
-        System.out.println("  (Fecha no necesaria - ID completo detectado)");
-        // Extraer fecha del transmission ID completo (posiciones 6-13)
-        // Formato: rTTIIEEEEEJJJSS -> EEEEE es fecha YYJJJ
-        date = "20260116"; // Valor dummy, no se usa en receive cuando es 14 chars
-    }
-
-    // Archivo destino
-    System.out.print("Archivo destino - Generar automatico? (S/N): ");
-    String autoMode = scanner.nextLine().trim();
-
-    String file;
-    if ("S".equalsIgnoreCase(autoMode)) {
-        file = "auto";
-        System.out.println("  Se usara patron del mipmanager.ini: autoNameReceive");
-    } else {
-        System.out.print("Especifique ruta del archivo: ");
-        file = scanner.nextLine().trim();
-    }
-
-    // Encode
-    System.out.println("Formato del archivo a guardar:");
-    System.out.println("  (1) ASCII - Convierte IPM a texto plano");
-    System.out.println("  (2) EBCDIC - Mantiene formato IPM original");
-    System.out.print("Seleccione: ");
-    String encodeOption = scanner.nextLine().trim();
-    String encode = "1".equals(encodeOption) ? "ASCII" : "EBCDIC";
-
-    // Debug
-    System.out.print("Activar modo debug? (S/N): ");
-    String debugOption = scanner.nextLine().trim();
-    interactiveDebug = "S".equalsIgnoreCase(debugOption);
-
-    // Ejecutar recepcion
-    System.out.println("\n--- Iniciando recepcion ---");
-    MipParams p = new MipParams();
-    p.mode = "receive";
-    p.ip = ip;
-    p.port = port;
-    p.file = file;
-    p.ipmName = ipmName;
-    p.date = date;
-    p.encode = encode;
-
-    runReceiveMode(p, cfg);
     
-    System.out.println("\nPresione ENTER para continuar...");
-    scanner.nextLine();
+    // Determinar si es año bisiesto
+    boolean isLeapYear = (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0);
+    
+    // Dias por mes
+    int[] daysInMonth = {
+        31, // Enero
+        isLeapYear ? 29 : 28, // Febrero
+        31, // Marzo
+        30, // Abril
+        31, // Mayo
+        30, // Junio
+        31, // Julio
+        31, // Agosto
+        30, // Septiembre
+        31, // Octubre
+        30, // Noviembre
+        31  // Diciembre
+    };
+    
+    // Calcular mes y dia
+    int month = 1;
+    int dayOfMonth = julianDay;
+    
+    for (int i = 0; i < daysInMonth.length; i++) {
+        if (dayOfMonth <= daysInMonth[i]) {
+            month = i + 1;
+            break;
+        }
+        dayOfMonth -= daysInMonth[i];
+    }
+    
+    // Formatear como YYYYMMDD
+    return String.format("%04d%02d%02d", year, month, dayOfMonth);
 }
