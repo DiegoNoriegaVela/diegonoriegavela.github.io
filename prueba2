@@ -1,12 +1,12 @@
 /**
  * Formatea reporte T150 (Excepciones)
- * Regla: Cada registro empieza con "1IP" y tiene 134 caracteres máximo
+ * Regla: Líneas de 134 caracteres, EXCEPTO cuando encuentra "1IP" que fuerza nueva línea
  */
 private static void formatT150Report(String transmissionId, File inputFile, 
         String outputFile, boolean debugMode) throws Exception {
     
     if (DEBUG || debugMode) {
-        System.out.println("DEBUG: Aplicando formato T150 (registros de 134 chars iniciando con '1IP')");
+        System.out.println("DEBUG: Aplicando formato T150 (134 chars/línea, '1IP' fuerza nueva línea)");
     }
 
     try (BufferedReader reader = new BufferedReader(new FileReader(inputFile));
@@ -33,42 +33,46 @@ private static void formatT150Report(String transmissionId, File inputFile,
         int totalLength = fullText.length();
 
         while (position < totalLength) {
-            // Buscar el próximo "1IP" desde la posición actual
-            int nextRecordStart = fullText.indexOf("1IP", position + 1);
+            // Calcular cuántos caracteres quedan
+            int remaining = totalLength - position;
+            
+            // Determinar cuántos caracteres tomar (máximo 134)
+            int charsToTake = Math.min(134, remaining);
+            
+            // Extraer el fragmento candidato
+            String candidate = fullText.substring(position, position + charsToTake);
+            
+            // Buscar "1IP" dentro de este fragmento (excepto al inicio)
+            int ipmIndex = candidate.indexOf("1IP", 1); // Buscar desde posición 1, no desde 0
             
             String recordLine;
             
-            if (nextRecordStart == -1) {
-                // No hay más registros "1IP", tomar el resto del texto
-                recordLine = fullText.substring(position);
-            } else {
-                // Hay otro registro "1IP", cortar hasta ahí
-                recordLine = fullText.substring(position, nextRecordStart);
-            }
-            
-            // Validar que la línea tenga máximo 134 caracteres
-            if (recordLine.length() > 134) {
+            if (ipmIndex != -1) {
+                // Se encontró "1IP" dentro del fragmento
+                // Cortar ANTES del "1IP" encontrado
+                recordLine = candidate.substring(0, ipmIndex);
+                position += ipmIndex; // Avanzar hasta el "1IP"
+                
                 if (DEBUG || debugMode) {
-                    System.out.println("DEBUG: ADVERTENCIA - Línea " + (linesWritten + 1) + 
-                        " excede 134 caracteres (" + recordLine.length() + "), truncando");
+                    System.out.println("DEBUG: '1IP' encontrado en pos " + ipmIndex + 
+                        ", cortando línea en " + recordLine.length() + " chars");
                 }
-                recordLine = recordLine.substring(0, 134);
+            } else {
+                // No se encontró "1IP", tomar los 134 caracteres completos
+                recordLine = candidate;
+                position += charsToTake;
             }
             
-            // Escribir la línea
+            // Escribir la línea (puede tener menos de 134 si se encontró "1IP")
             writer.println(recordLine);
             linesWritten++;
             
             if (DEBUG || debugMode) {
-                System.out.println("DEBUG: Línea " + linesWritten + ": " + recordLine.length() + " chars - " + 
-                    (recordLine.startsWith("1IP") ? "Inicia con 1IP" : "NO inicia con 1IP"));
+                String preview = recordLine.length() > 40 ? 
+                    recordLine.substring(0, 40) + "..." : recordLine;
+                System.out.println("DEBUG: Línea " + linesWritten + ": " + 
+                    recordLine.length() + " chars - Inicia: \"" + preview + "\"");
             }
-            
-            // Avanzar posición
-            if (nextRecordStart == -1) {
-                break; // No hay más registros
-            }
-            position = nextRecordStart;
         }
 
         if (DEBUG || debugMode) {
