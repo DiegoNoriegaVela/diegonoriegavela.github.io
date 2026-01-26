@@ -1,55 +1,78 @@
 /**
- * Convierte archivo IPM a ASCII usando IpmConverter y aplica formateo de reporte
- * Detecta automaticamente si usar decodeipm o decode
+ * Formatea reporte T150 (Excepciones)
+ * Regla: Cada registro empieza con "1IP" y tiene 134 caracteres máximo
  */
-private static void convertIpmToAscii(String inputIpm, String finalOutputFile, 
-        String headerName, String fileName, boolean debugMode) throws Exception {
-    
-    boolean isIpmWithRdw = isIpmFileType(fileName);
+private static void formatT150Report(String transmissionId, File inputFile, 
+        String outputFile, boolean debugMode) throws Exception {
     
     if (DEBUG || debugMode) {
-        System.out.println("DEBUG: Tipo de archivo: " + 
-            (isIpmWithRdw ? "IPM con RDW" : "EBCDIC plano"));
+        System.out.println("DEBUG: Aplicando formato T150 (registros de 134 chars iniciando con '1IP')");
     }
 
-    File tempAsciiFile = null;
-    try {
-        // 1. Crear archivo temporal para salida de conversion
-        tempAsciiFile = File.createTempFile("decoded_ascii_", ".txt");
+    try (BufferedReader reader = new BufferedReader(new FileReader(inputFile));
+         PrintWriter writer = new PrintWriter(new FileWriter(outputFile))) {
+
+        // Escribir header
+        writer.println("[" + transmissionId + "]");
+
+        // Leer todo el contenido
+        StringBuilder content = new StringBuilder();
+        String line;
+        while ((line = reader.readLine()) != null) {
+            content.append(line);
+        }
+
+        String fullText = content.toString();
+        
         if (DEBUG || debugMode) {
-            System.out.println("DEBUG: Temporal ASCII (sin formatear): " + tempAsciiFile.getAbsolutePath());
+            System.out.println("DEBUG: Longitud total del texto: " + fullText.length());
         }
 
-        // 2. Ejecutar conversion EBCDIC -> ASCII
-        if (isIpmWithRdw) {
-            IpmConverter.runDecodeIpm(inputIpm, tempAsciiFile.getAbsolutePath());
-        } else {
-            IpmConverter.runDecode(inputIpm, tempAsciiFile.getAbsolutePath());
-        }
-        
-        System.out.println("Decodificacion completada");
+        int linesWritten = 0;
+        int position = 0;
+        int totalLength = fullText.length();
 
-        // 3. Aplicar formateo de reporte (incluye header y reglas específicas)
-        System.out.println("Aplicando formateo de reporte...");
-        
-        // Obtener descripción del formateo
-        String formattingDesc = MipReportFormatter.getFormattingDescription(headerName);
-        if (DEBUG || debugMode) {
-            System.out.println("DEBUG: Formato: " + formattingDesc);
-        }
-        
-        // Aplicar formateo según tipo de reporte
-        MipReportFormatter.formatReport(headerName, tempAsciiFile, finalOutputFile, debugMode);
-        
-        System.out.println("Formateo de reporte completado");
-
-    } finally {
-        // 4. Limpiar temporal
-        if (tempAsciiFile != null && tempAsciiFile.exists()) {
-            if (DEBUG || debugMode) {
-                System.out.println("DEBUG: Eliminando temporal ASCII: " + tempAsciiFile.getName());
+        while (position < totalLength) {
+            // Buscar el próximo "1IP" desde la posición actual
+            int nextRecordStart = fullText.indexOf("1IP", position + 1);
+            
+            String recordLine;
+            
+            if (nextRecordStart == -1) {
+                // No hay más registros "1IP", tomar el resto del texto
+                recordLine = fullText.substring(position);
+            } else {
+                // Hay otro registro "1IP", cortar hasta ahí
+                recordLine = fullText.substring(position, nextRecordStart);
             }
-            tempAsciiFile.delete();
+            
+            // Validar que la línea tenga máximo 134 caracteres
+            if (recordLine.length() > 134) {
+                if (DEBUG || debugMode) {
+                    System.out.println("DEBUG: ADVERTENCIA - Línea " + (linesWritten + 1) + 
+                        " excede 134 caracteres (" + recordLine.length() + "), truncando");
+                }
+                recordLine = recordLine.substring(0, 134);
+            }
+            
+            // Escribir la línea
+            writer.println(recordLine);
+            linesWritten++;
+            
+            if (DEBUG || debugMode) {
+                System.out.println("DEBUG: Línea " + linesWritten + ": " + recordLine.length() + " chars - " + 
+                    (recordLine.startsWith("1IP") ? "Inicia con 1IP" : "NO inicia con 1IP"));
+            }
+            
+            // Avanzar posición
+            if (nextRecordStart == -1) {
+                break; // No hay más registros
+            }
+            position = nextRecordStart;
+        }
+
+        if (DEBUG || debugMode) {
+            System.out.println("DEBUG: Total de líneas escritas: " + linesWritten);
         }
     }
 }
