@@ -1,555 +1,204 @@
 package com.scotiabank.mip;
 
 import java.io.*;
-import java.util.*;
-import java.text.SimpleDateFormat;
 
 /**
- * MipManager - Gestor Principal del Sistema MIP
+ * MipReportFormatter - Formateador de Reportes MIP
  * 
- * Orquesta la transferencia y conversion de archivos IPM con Mastercard.
- * Integra MipFileTransfer e IpmConverter de forma directa.
+ * Aplica reglas de formateo específicas para cada tipo de archivo IPM
+ * al convertir de EBCDIC a ASCII, generando reportes legibles.
+ * 
+ * Tipos soportados:
+ * - T112, T120: Archivos IPM estándar (sin formateo especial)
+ * - T150: Reporte de excepciones (830 caracteres por línea)
+ * - T007, T113, T121, T140: Reportes estándar
  * 
  * @author Sistema de Integracion Mastercard
- * @version 2.1
+ * @version 1.0
  * @package com.scotiabank.mip
  */
-public class MipManager {
+public class MipReportFormatter {
 
     private static final boolean DEBUG = Boolean.getBoolean("mip.debug");
 
-    public static void main(String[] args) {
-        try {
-            if (args.length == 0) {
-                // Modo interactivo - delegar a MipInteractive
-                MipConfig cfg = MipConfig.load();
-                MipInteractive.runInteractiveMode(cfg);
-            } else if ("help".equalsIgnoreCase(args[0])) {
-                printHelp();
-            } else {
-                // Modo por línea de comandos
-                runCommandLineMode(args);
-            }
-
-        } catch (Exception e) {
-            System.err.println("\n==============================================");
-            System.err.println("ERROR FATAL");
-            System.err.println("==============================================");
-            System.err.println("Mensaje: " + e.getMessage());
-            if (DEBUG) {
-                e.printStackTrace();
-            }
-            System.exit(1);
-        }
-    }
-
-    /* ========================================================================
-     * MODO LINEA DE COMANDOS
-     * ======================================================================== */
-
-    private static void runCommandLineMode(String[] args) throws Exception {
-        // Cargar configuracion
-        MipConfig cfg = MipConfig.load();
-
-        // Parsear parametros
-        MipParams p = MipParams.parse(args, true);
-        if (p == null) {
-            System.exit(2);
-        }
-
-        // Ejecutar modo correspondiente
-        if ("send".equalsIgnoreCase(p.mode)) {
-            executeSend(p, cfg, DEBUG);
-        } else if ("receive".equalsIgnoreCase(p.mode)) {
-            executeReceive(p, cfg, DEBUG);
-        }
-    }
-
-    /* ========================================================================
-     * MODO SEND - Envio de archivos TO Mastercard
-     * ======================================================================== */
-
-    public static void executeSend(MipParams p, MipConfig cfg, boolean debugMode) throws Exception {
-        System.out.println("\n==============================================");
-        System.out.println("MODO SEND - Envio a Mastercard");
-        System.out.println("==============================================");
-
-        File sourceFile = new File(p.file);
-        if (!sourceFile.exists()) {
-            throw new FileNotFoundException("Archivo no encontrado: " + p.file);
-        }
-
-        MipFileTransfer.MipTransferResult result = null;
-        String responseCode = "9989999"; // Por defecto
-
-        try {
-            if ("EBCDIC".equalsIgnoreCase(p.encode)) {
-                // CASO 1: Archivo ya en EBCDIC - envio directo
-                System.out.println("[MODO DIRECTO] Archivo ya en formato EBCDIC");
-                System.out.println("Enviando sin conversion...\n");
-
-                result = MipFileTransfer.sendToMip(p.ip, p.port, p.file, p.ipmName);
-                responseCode = result.responseCode;
-
-                System.out.println("\n==============================================");
-                System.out.println("ENVIO COMPLETADO EXITOSAMENTE");
-                System.out.println("Archivo: " + sourceFile.getName());
-                System.out.println("==============================================");
-
-            } else if ("ASCII".equalsIgnoreCase(p.encode)) {
-                // CASO 2: Archivo ASCII - requiere conversion
-                System.out.println("[MODO CONVERSION] Convirtiendo ASCII a IPM");
-                
-                File tempIpm = null;
-                try {
-                    // PASO 1: Convertir ASCII a IPM
-                    System.out.println("[1/3] Codificando archivo a formato IPM...");
-                    tempIpm = createTempFile(p.ipmName);
-                    
-                    if (DEBUG || debugMode) {
-                        System.out.println("DEBUG: Archivo temporal: " + tempIpm.getAbsolutePath());
-                    }
-
-                    convertAsciiToIpm(p.file, tempIpm.getAbsolutePath(), p.ipmName, debugMode);
-                    System.out.println("Codificacion completada\n");
-
-                    // PASO 2: Transferir archivo IPM
-                    System.out.println("[2/3] Transfiriendo archivo IPM al MIP...");
-                    result = MipFileTransfer.sendToMip(p.ip, p.port, 
-                        tempIpm.getAbsolutePath(), p.ipmName);
-                    responseCode = result.responseCode;
-
-                    System.out.println("\n==============================================");
-                    System.out.println("ENVIO COMPLETADO EXITOSAMENTE");
-                    System.out.println("Archivo procesado: " + sourceFile.getName());
-                    System.out.println("==============================================");
-
-                } finally {
-                    // PASO 3: Limpiar temporal
-                    if (tempIpm != null && tempIpm.exists()) {
-                        if (DEBUG || debugMode) {
-                            System.out.println("DEBUG: Eliminando temporal: " + tempIpm.getName());
-                        }
-                        tempIpm.delete();
-                    }
-                }
-
-            } else {
-                throw new IllegalArgumentException("Valor invalido para --encode: " + p.encode);
-            }
-
-            // Registrar en log con codigo de respuesta MIP
-            if (cfg.miplog != null && result != null) {
-                logTransmission(cfg.miplog, result.transmissionId, result.responseCode, debugMode);
-            }
-
-        } catch (MipFileTransfer.MipException e) {
-            responseCode = e.responseCode;
-            if (cfg.miplog != null) {
-                logTransmission(cfg.miplog, p.ipmName, responseCode, debugMode);
-            }
-            throw e;
-            
-        } catch (Exception e) {
-            if (cfg.miplog != null) {
-                logTransmission(cfg.miplog, p.ipmName, responseCode, debugMode);
-            }
-            throw e;
-        }
-    }
-
-    /* ========================================================================
-     * MODO RECEIVE - Recepcion de archivos FROM Mastercard
-     * ======================================================================== */
-
-    public static void executeReceive(MipParams p, MipConfig cfg, boolean debugMode) throws Exception {
-        System.out.println("\n==============================================");
-        System.out.println("MODO RECEIVE - Recepcion desde Mastercard");
-        System.out.println("==============================================");
-
-        MipFileTransfer.MipTransferResult result = null;
-        String responseCode = "9989999";
+    /**
+     * Formatea un archivo ASCII según el tipo de reporte
+     * 
+     * @param transmissionId ID de transmisión completo (ej: T1500284001601)
+     * @param inputAsciiFile Archivo ASCII sin formatear
+     * @param outputFile Archivo de salida formateado con header
+     * @param debugMode Activar mensajes debug
+     * @throws Exception Si ocurre error en formateo
+     */
+    public static void formatReport(String transmissionId, File inputAsciiFile, 
+            String outputFile, boolean debugMode) throws Exception {
         
-        try {
-            System.out.println("[1/4] Conectando al MIP y solicitando archivo...");
-            
-            result = MipFileTransfer.receiveFromMip(p.ip, p.port, "auto", p.ipmName, p.date);
-            responseCode = result.responseCode;
-            
-        } catch (MipFileTransfer.MipException e) {
-            responseCode = e.responseCode;
-            if (cfg.miplog != null) {
-                logTransmission(cfg.miplog, p.ipmName, responseCode, debugMode);
-            }
-            throw e;
-            
-        } catch (Exception e) {
-            if (cfg.miplog != null) {
-                logTransmission(cfg.miplog, p.ipmName, responseCode, debugMode);
-            }
-            throw e;
-        }
-
-        if (result == null || result.transmissionId == null) {
-            if (cfg.miplog != null) {
-                logTransmission(cfg.miplog, p.ipmName, responseCode, debugMode);
-            }
-            throw new Exception("No se pudo descargar el archivo desde el MIP");
-        }
-
-        String downloadedFileName = result.transmissionId + ".EBCDIC";
-        File downloadedIpmFile = new File(downloadedFileName);
+        // Extraer tipo de reporte (primeros 4 caracteres)
+        String reportType = transmissionId.length() >= 4 ? 
+            transmissionId.substring(0, 4).toUpperCase() : transmissionId;
         
-        if (!downloadedIpmFile.exists()) {
-            if (cfg.miplog != null) {
-                logTransmission(cfg.miplog, result.transmissionId, "9989999", debugMode);
-            }
-            throw new FileNotFoundException("Archivo descargado no encontrado: " + downloadedFileName);
-        }
-
-        System.out.println("Archivo descargado: " + downloadedIpmFile.getName());
-
-        String headerName = result.transmissionId;
-
         if (DEBUG || debugMode) {
-            System.out.println("DEBUG: Header a insertar: [" + headerName + "]");
+            System.out.println("DEBUG: Tipo de reporte detectado: " + reportType);
         }
 
-        System.out.println("[2/4] Procesando archivo...");
-
-        String finalDestinationPath;
-        
-        if ("auto".equalsIgnoreCase(p.file)) {
-            if (cfg.autoNameReceive == null || cfg.autoNameReceive.trim().isEmpty()) {
-                throw new IllegalArgumentException(
-                    "Modo 'auto' requiere la configuracion 'autoNameReceive' en mipmanager.ini");
-            }
-            
-            finalDestinationPath = resolveAutoNamePattern(
-                cfg.autoNameReceive, 
-                result.transmissionId, 
-                p.date,
-                p.encode,
-                debugMode
-            );
-            
-            System.out.println("Modo AUTO: Nombre generado: " + finalDestinationPath);
+        // Aplicar regla de formateo según tipo
+        if ("T150".equals(reportType)) {
+            formatT150Report(transmissionId, inputAsciiFile, outputFile, debugMode);
+        } else if ("T112".equals(reportType) || "T120".equals(reportType)) {
+            formatStandardIpmReport(transmissionId, inputAsciiFile, outputFile, debugMode);
+        } else if ("T007".equals(reportType) || "T113".equals(reportType) || 
+                   "T121".equals(reportType) || "T140".equals(reportType)) {
+            formatStandardReport(transmissionId, inputAsciiFile, outputFile, debugMode);
         } else {
-            finalDestinationPath = p.file;
-        }
-
-        try {
-            if ("EBCDIC".equalsIgnoreCase(p.encode)) {
-                System.out.println("Modo EBCDIC: Copiando contenido con header...");
-                prependHeaderAndCopy(downloadedIpmFile, finalDestinationPath, headerName);
-                System.out.println("Archivo guardado: " + finalDestinationPath);
-
-            } else if ("ASCII".equalsIgnoreCase(p.encode)) {
-                System.out.println("Modo ASCII: Decodificando IPM...");
-                convertIpmToAscii(downloadedIpmFile.getAbsolutePath(), 
-                    finalDestinationPath, headerName, result.transmissionId, debugMode);
-                System.out.println("Archivo guardado: " + finalDestinationPath);
-
-            } else {
-                throw new IllegalArgumentException("Valor invalido para --encode: " + p.encode);
+            // Tipo desconocido - formateo estándar
+            if (DEBUG || debugMode) {
+                System.out.println("DEBUG: Tipo desconocido, usando formateo estándar");
             }
-
-            System.out.println("[3/4] Limpiando archivos temporales...");
-            if (downloadedIpmFile.exists()) {
-                downloadedIpmFile.delete();
-                if (DEBUG || debugMode) {
-                    System.out.println("DEBUG: Eliminado: " + downloadedIpmFile.getName());
-                }
-            }
-
-            System.out.println("\n==============================================");
-            System.out.println("RECEPCION COMPLETADA EXITOSAMENTE");
-            System.out.println("Archivo: " + finalDestinationPath);
-            System.out.println("==============================================");
-
-            if (cfg.miplog != null) {
-                logTransmission(cfg.miplog, result.transmissionId, result.responseCode, debugMode);
-            }
-
-        } catch (Exception e) {
-            if (cfg.miplog != null) {
-                logTransmission(cfg.miplog, result.transmissionId, "9989999", debugMode);
-            }
-            throw e;
+            formatStandardReport(transmissionId, inputAsciiFile, outputFile, debugMode);
         }
     }
 
-    /* ========================================================================
-     * CONVERSION
-     * ======================================================================== */
-
-    private static void convertAsciiToIpm(String inputAscii, String outputIpm, 
-            String ipmName, boolean debugMode) throws Exception {
-        
-        boolean isIpmWithRdw = isIpmFileType(ipmName);
+    /**
+     * Formatea reporte T150 (Excepciones)
+     * Regla: Cortar cada 830 caracteres por línea
+     */
+    private static void formatT150Report(String transmissionId, File inputFile, 
+            String outputFile, boolean debugMode) throws Exception {
         
         if (DEBUG || debugMode) {
-            System.out.println("DEBUG: Tipo de archivo: " + 
-                (isIpmWithRdw ? "IPM con RDW" : "EBCDIC plano"));
+            System.out.println("DEBUG: Aplicando formato T150 (830 chars/linea)");
         }
 
-        if (isIpmWithRdw) {
-            IpmConverter.runEncodeIpm(inputAscii, outputIpm);
-        } else {
-            IpmConverter.runEncode(inputAscii, outputIpm);
+        try (BufferedReader reader = new BufferedReader(new FileReader(inputFile));
+             PrintWriter writer = new PrintWriter(new FileWriter(outputFile))) {
+
+            // Escribir header
+            writer.println("[" + transmissionId + "]");
+
+            // Leer todo el contenido
+            StringBuilder content = new StringBuilder();
+            String line;
+            while ((line = reader.readLine()) != null) {
+                content.append(line);
+            }
+
+            String fullText = content.toString();
+            
+            if (DEBUG || debugMode) {
+                System.out.println("DEBUG: Longitud total del texto: " + fullText.length());
+            }
+
+            // Cortar en bloques de 830 caracteres
+            int charsPerLine = 830;
+            int totalChars = fullText.length();
+            int linesWritten = 0;
+
+            for (int i = 0; i < totalChars; i += charsPerLine) {
+                int end = Math.min(i + charsPerLine, totalChars);
+                String chunk = fullText.substring(i, end);
+                writer.println(chunk);
+                linesWritten++;
+            }
+
+            if (DEBUG || debugMode) {
+                System.out.println("DEBUG: Líneas escritas: " + linesWritten);
+            }
         }
     }
 
-    private static void convertIpmToAscii(String inputIpm, String finalOutputFile, 
-            String headerName, String fileName, boolean debugMode) throws Exception {
-        
-        boolean isIpmWithRdw = isIpmFileType(fileName);
+    /**
+     * Formatea reportes IPM estándar (T112, T120)
+     * Regla: Solo agregar header, mantener estructura original
+     */
+    private static void formatStandardIpmReport(String transmissionId, File inputFile, 
+            String outputFile, boolean debugMode) throws Exception {
         
         if (DEBUG || debugMode) {
-            System.out.println("DEBUG: Tipo de archivo: " + 
-                (isIpmWithRdw ? "IPM con RDW" : "EBCDIC plano"));
+            System.out.println("DEBUG: Aplicando formato IPM estándar (preservar estructura)");
         }
 
-        File tempAsciiFile = null;
-        try {
-            tempAsciiFile = File.createTempFile("decoded_ascii_", ".txt");
+        try (BufferedReader reader = new BufferedReader(new FileReader(inputFile));
+             PrintWriter writer = new PrintWriter(new FileWriter(outputFile))) {
+
+            // Escribir header
+            writer.println("[" + transmissionId + "]");
+
+            // Copiar contenido línea por línea
+            String line;
+            int linesWritten = 0;
+            while ((line = reader.readLine()) != null) {
+                writer.println(line);
+                linesWritten++;
+            }
+
             if (DEBUG || debugMode) {
-                System.out.println("DEBUG: Temporal ASCII: " + tempAsciiFile.getAbsolutePath());
-            }
-
-            if (isIpmWithRdw) {
-                IpmConverter.runDecodeIpm(inputIpm, tempAsciiFile.getAbsolutePath());
-            } else {
-                IpmConverter.runDecode(inputIpm, tempAsciiFile.getAbsolutePath());
-            }
-            
-            System.out.println("Decodificacion completada");
-            System.out.println("Escribiendo archivo final con header...");
-            
-            try (FileOutputStream fos = new FileOutputStream(finalOutputFile);
-                 FileInputStream fis = new FileInputStream(tempAsciiFile)) {
-
-                String headerLine = "[" + headerName + "]" + System.lineSeparator();
-                fos.write(headerLine.getBytes());
-
-                byte[] buffer = new byte[8192];
-                int n;
-                while ((n = fis.read(buffer)) > 0) {
-                    fos.write(buffer, 0, n);
-                }
-            }
-
-        } finally {
-            if (tempAsciiFile != null && tempAsciiFile.exists()) {
-                if (DEBUG || debugMode) {
-                    System.out.println("DEBUG: Eliminando temporal ASCII: " + tempAsciiFile.getName());
-                }
-                tempAsciiFile.delete();
+                System.out.println("DEBUG: Líneas copiadas: " + linesWritten);
             }
         }
     }
 
-    /* ========================================================================
-     * AUTO-NAMING
-     * ======================================================================== */
-
-    private static String resolveAutoNamePattern(String pattern, String transmissionId, 
-            String date, String encode, boolean debugMode) {
-        
-        String result = pattern;
-        
-        String firstFour = transmissionId.length() >= 4 ? 
-            transmissionId.substring(0, 4) : transmissionId;
-        
-        result = result.replace("TXXX", firstFour);
-        
-        String dateToUse;
-        
-        if (date != null && date.matches("\\d{8}")) {
-            dateToUse = date;
-            if (DEBUG || debugMode) {
-                System.out.println("DEBUG: Usando fecha proporcionada: " + date);
-            }
-        } else if (transmissionId.length() == 14) {
-            try {
-                String yearAndJulian = transmissionId.substring(5, 10);
-                int yy = Integer.parseInt(yearAndJulian.substring(0, 2));
-                int julianDay = Integer.parseInt(yearAndJulian.substring(2, 5));
-                
-                int year = 2000 + yy;
-                dateToUse = julianDayToDate(year, julianDay);
-                
-                if (DEBUG || debugMode) {
-                    System.out.println("DEBUG: Fecha extraida del transmission ID:");
-                    System.out.println("DEBUG:   YY = " + yy + ", JJJ = " + julianDay);
-                    System.out.println("DEBUG:   Año = " + year);
-                    System.out.println("DEBUG:   Fecha convertida: " + dateToUse);
-                }
-                
-            } catch (Exception e) {
-                SimpleDateFormat sdf = new SimpleDateFormat("yyyyMMdd");
-                dateToUse = sdf.format(new Date());
-                
-                if (DEBUG || debugMode) {
-                    System.out.println("DEBUG: Error extrayendo fecha, usando actual: " + dateToUse);
-                }
-            }
-        } else {
-            SimpleDateFormat sdf = new SimpleDateFormat("yyyyMMdd");
-            dateToUse = sdf.format(new Date());
-            
-            if (DEBUG || debugMode) {
-                System.out.println("DEBUG: Usando fecha actual: " + dateToUse);
-            }
-        }
-        
-        result = result.replace("AAAAMMDD", dateToUse);
-        
-        if (!result.contains(".")) {
-            if ("ASCII".equalsIgnoreCase(encode)) {
-                result += ".txt";
-            } else if ("EBCDIC".equalsIgnoreCase(encode)) {
-                result += ".ipm";
-            }
-        }
+    /**
+     * Formatea reportes estándar (T007, T113, T121, T140)
+     * Regla: Agregar header y mantener formato original
+     */
+    private static void formatStandardReport(String transmissionId, File inputFile, 
+            String outputFile, boolean debugMode) throws Exception {
         
         if (DEBUG || debugMode) {
-            System.out.println("DEBUG: Patron original: " + pattern);
-            System.out.println("DEBUG: TXXX -> " + firstFour);
-            System.out.println("DEBUG: AAAAMMDD -> " + dateToUse);
-            System.out.println("DEBUG: Resultado: " + result);
+            System.out.println("DEBUG: Aplicando formato estándar");
         }
-        
-        return result;
-    }
 
-    private static String julianDayToDate(int year, int julianDay) {
-        if (julianDay < 1 || julianDay > 366) {
-            throw new IllegalArgumentException("Dia juliano invalido: " + julianDay);
-        }
-        
-        boolean isLeapYear = (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0);
-        
-        int[] daysInMonth = {
-            31, isLeapYear ? 29 : 28, 31, 30, 31, 30,
-            31, 31, 30, 31, 30, 31
-        };
-        
-        int month = 1;
-        int dayOfMonth = julianDay;
-        
-        for (int i = 0; i < daysInMonth.length; i++) {
-            if (dayOfMonth <= daysInMonth[i]) {
-                month = i + 1;
-                break;
+        try (BufferedReader reader = new BufferedReader(new FileReader(inputFile));
+             PrintWriter writer = new PrintWriter(new FileWriter(outputFile))) {
+
+            // Escribir header
+            writer.println("[" + transmissionId + "]");
+
+            // Copiar contenido línea por línea
+            String line;
+            int linesWritten = 0;
+            while ((line = reader.readLine()) != null) {
+                writer.println(line);
+                linesWritten++;
             }
-            dayOfMonth -= daysInMonth[i];
-        }
-        
-        return String.format("%04d%02d%02d", year, month, dayOfMonth);
-    }
 
-    /* ========================================================================
-     * LOGGING
-     * ======================================================================== */
-
-    private static void logTransmission(String logPath, String transmissionId, 
-            String responseCode, boolean debugMode) {
-        try (FileWriter fw = new FileWriter(logPath, true)) {
-            SimpleDateFormat sdf = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss");
-            String timestamp = sdf.format(new Date());
-            
-            String logEntry = "[" + responseCode + "-" + transmissionId + 
-                ": " + timestamp + "]" + System.lineSeparator();
-            
-            fw.write(logEntry);
-            
             if (DEBUG || debugMode) {
-                System.out.println("DEBUG: Log registrado: " + logEntry.trim());
-            }
-            
-        } catch (IOException e) {
-            System.err.println("ADVERTENCIA: No se pudo escribir en el log: " + e.getMessage());
-        }
-    }
-
-    /* ========================================================================
-     * UTILIDADES
-     * ======================================================================== */
-
-    private static boolean isIpmFileType(String fileName) {
-        String name = fileName.toUpperCase();
-        
-        if (name.contains("R111") || name.contains("R119") || 
-            name.contains("RSP1") || name.contains("RSP3")) {
-            return true;
-        }
-        
-        if (name.contains("T112") || name.contains("T120")) {
-            return true;
-        }
-        
-        if (name.contains("T007") || name.contains("T113") || name.contains("T121") ||
-            name.contains("T140") || name.contains("T150")) {
-            return false;
-        }
-        
-        if (name.contains("T067") || name.contains("T068") ||
-            name.contains("T167") || name.contains("T168")) {
-            return false;
-        }
-        
-        return true;
-    }
-
-    private static File createTempFile(String prefix) throws IOException {
-        SimpleDateFormat sdf = new SimpleDateFormat("yyyyMMddHHmmss");
-        String timestamp = sdf.format(new Date());
-        
-        String fileName = prefix + "_" + timestamp + ".ipm";
-        return new File(fileName);
-    }
-
-    private static void prependHeaderAndCopy(File sourceFile, String destPath, 
-            String headerName) throws IOException {
-        
-        try (FileOutputStream fos = new FileOutputStream(destPath);
-             FileInputStream fis = new FileInputStream(sourceFile)) {
-
-            String headerLine = "[" + headerName + "]" + System.lineSeparator();
-            fos.write(headerLine.getBytes());
-
-            byte[] buffer = new byte[8192];
-            int n;
-            while ((n = fis.read(buffer)) > 0) {
-                fos.write(buffer, 0, n);
+                System.out.println("DEBUG: Líneas copiadas: " + linesWritten);
             }
         }
     }
 
-    private static void printHelp() {
-        System.out.println("=================================================================");
-        System.out.println("MipManager v2.1 - Gestor de Transferencias MIP Mastercard");
-        System.out.println("=================================================================");
-        System.out.println();
-        System.out.println("USO:");
-        System.out.println("  Modo interactivo:");
-        System.out.println("    java -jar mipmgr-1.0.0.jar");
-        System.out.println();
-        System.out.println("  Modo linea de comandos:");
-        System.out.println("    java -jar mipmgr-1.0.0.jar [PARAMETROS]");
-        System.out.println();
-        System.out.println("PARAMETROS:");
-        System.out.println("  --mode <send|receive>   Modo de operacion");
-        System.out.println("  --ip <direccion>        IP del MIP");
-        System.out.println("  --port <puerto>         Puerto del MIP");
-        System.out.println("  --file <path|auto>      Archivo");
-        System.out.println("  --encode <EBCDIC|ASCII> Formato");
-        System.out.println("  --ipmname <id>          Transmission ID");
-        System.out.println("  --date <YYYYMMDD>       Fecha (opcional si ID es 14 chars)");
-        System.out.println();
-        System.out.println("DEBUG:");
-        System.out.println("  java -Dmip.debug=true -jar mipmgr-1.0.0.jar");
-        System.out.println("=================================================================");
+    /**
+     * Valida si un tipo de reporte requiere formateo especial
+     */
+    public static boolean requiresSpecialFormatting(String transmissionId) {
+        String reportType = transmissionId.length() >= 4 ? 
+            transmissionId.substring(0, 4).toUpperCase() : transmissionId;
+        
+        // Solo T150 requiere formateo especial por ahora
+        return "T150".equals(reportType);
+    }
+
+    /**
+     * Obtiene la descripción del formateo aplicado
+     */
+    public static String getFormattingDescription(String transmissionId) {
+        String reportType = transmissionId.length() >= 4 ? 
+            transmissionId.substring(0, 4).toUpperCase() : transmissionId;
+        
+        switch (reportType) {
+            case "T150":
+                return "Reporte de Excepciones (830 caracteres por línea)";
+            case "T112":
+            case "T120":
+                return "Archivo IPM estándar (estructura preservada)";
+            case "T007":
+            case "T113":
+            case "T121":
+            case "T140":
+                return "Reporte estándar";
+            default:
+                return "Formato estándar";
+        }
     }
 }
