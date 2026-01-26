@@ -1,370 +1,555 @@
 package com.scotiabank.mip;
 
 import java.io.*;
-import java.util.Scanner;
+import java.util.*;
+import java.text.SimpleDateFormat;
 
 /**
- * MipInteractive - Interface de Usuario Interactiva
+ * MipManager - Gestor Principal del Sistema MIP
  * 
- * Proporciona menús interactivos por consola para el MipManager.
- * Maneja toda la entrada del usuario y validaciones básicas.
+ * Orquesta la transferencia y conversion de archivos IPM con Mastercard.
+ * Integra MipFileTransfer e IpmConverter de forma directa.
  * 
  * @author Sistema de Integracion Mastercard
- * @version 1.0
+ * @version 2.1
  * @package com.scotiabank.mip
  */
-public class MipInteractive {
+public class MipManager {
 
-    private static Scanner scanner = new Scanner(System.in);
-    private static boolean debugMode = false;
+    private static final boolean DEBUG = Boolean.getBoolean("mip.debug");
 
-    /**
-     * Ejecuta el menu principal interactivo
-     */
-    public static void runInteractiveMode(MipConfig cfg) throws Exception {
+    public static void main(String[] args) {
+        try {
+            if (args.length == 0) {
+                // Modo interactivo - delegar a MipInteractive
+                MipConfig cfg = MipConfig.load();
+                MipInteractive.runInteractiveMode(cfg);
+            } else if ("help".equalsIgnoreCase(args[0])) {
+                printHelp();
+            } else {
+                // Modo por línea de comandos
+                runCommandLineMode(args);
+            }
+
+        } catch (Exception e) {
+            System.err.println("\n==============================================");
+            System.err.println("ERROR FATAL");
+            System.err.println("==============================================");
+            System.err.println("Mensaje: " + e.getMessage());
+            if (DEBUG) {
+                e.printStackTrace();
+            }
+            System.exit(1);
+        }
+    }
+
+    /* ========================================================================
+     * MODO LINEA DE COMANDOS
+     * ======================================================================== */
+
+    private static void runCommandLineMode(String[] args) throws Exception {
+        // Cargar configuracion
+        MipConfig cfg = MipConfig.load();
+
+        // Parsear parametros
+        MipParams p = MipParams.parse(args, true);
+        if (p == null) {
+            System.exit(2);
+        }
+
+        // Ejecutar modo correspondiente
+        if ("send".equalsIgnoreCase(p.mode)) {
+            executeSend(p, cfg, DEBUG);
+        } else if ("receive".equalsIgnoreCase(p.mode)) {
+            executeReceive(p, cfg, DEBUG);
+        }
+    }
+
+    /* ========================================================================
+     * MODO SEND - Envio de archivos TO Mastercard
+     * ======================================================================== */
+
+    public static void executeSend(MipParams p, MipConfig cfg, boolean debugMode) throws Exception {
+        System.out.println("\n==============================================");
+        System.out.println("MODO SEND - Envio a Mastercard");
+        System.out.println("==============================================");
+
+        File sourceFile = new File(p.file);
+        if (!sourceFile.exists()) {
+            throw new FileNotFoundException("Archivo no encontrado: " + p.file);
+        }
+
+        MipFileTransfer.MipTransferResult result = null;
+        String responseCode = "9989999"; // Por defecto
+
+        try {
+            if ("EBCDIC".equalsIgnoreCase(p.encode)) {
+                // CASO 1: Archivo ya en EBCDIC - envio directo
+                System.out.println("[MODO DIRECTO] Archivo ya en formato EBCDIC");
+                System.out.println("Enviando sin conversion...\n");
+
+                result = MipFileTransfer.sendToMip(p.ip, p.port, p.file, p.ipmName);
+                responseCode = result.responseCode;
+
+                System.out.println("\n==============================================");
+                System.out.println("ENVIO COMPLETADO EXITOSAMENTE");
+                System.out.println("Archivo: " + sourceFile.getName());
+                System.out.println("==============================================");
+
+            } else if ("ASCII".equalsIgnoreCase(p.encode)) {
+                // CASO 2: Archivo ASCII - requiere conversion
+                System.out.println("[MODO CONVERSION] Convirtiendo ASCII a IPM");
+                
+                File tempIpm = null;
+                try {
+                    // PASO 1: Convertir ASCII a IPM
+                    System.out.println("[1/3] Codificando archivo a formato IPM...");
+                    tempIpm = createTempFile(p.ipmName);
+                    
+                    if (DEBUG || debugMode) {
+                        System.out.println("DEBUG: Archivo temporal: " + tempIpm.getAbsolutePath());
+                    }
+
+                    convertAsciiToIpm(p.file, tempIpm.getAbsolutePath(), p.ipmName, debugMode);
+                    System.out.println("Codificacion completada\n");
+
+                    // PASO 2: Transferir archivo IPM
+                    System.out.println("[2/3] Transfiriendo archivo IPM al MIP...");
+                    result = MipFileTransfer.sendToMip(p.ip, p.port, 
+                        tempIpm.getAbsolutePath(), p.ipmName);
+                    responseCode = result.responseCode;
+
+                    System.out.println("\n==============================================");
+                    System.out.println("ENVIO COMPLETADO EXITOSAMENTE");
+                    System.out.println("Archivo procesado: " + sourceFile.getName());
+                    System.out.println("==============================================");
+
+                } finally {
+                    // PASO 3: Limpiar temporal
+                    if (tempIpm != null && tempIpm.exists()) {
+                        if (DEBUG || debugMode) {
+                            System.out.println("DEBUG: Eliminando temporal: " + tempIpm.getName());
+                        }
+                        tempIpm.delete();
+                    }
+                }
+
+            } else {
+                throw new IllegalArgumentException("Valor invalido para --encode: " + p.encode);
+            }
+
+            // Registrar en log con codigo de respuesta MIP
+            if (cfg.miplog != null && result != null) {
+                logTransmission(cfg.miplog, result.transmissionId, result.responseCode, debugMode);
+            }
+
+        } catch (MipFileTransfer.MipException e) {
+            responseCode = e.responseCode;
+            if (cfg.miplog != null) {
+                logTransmission(cfg.miplog, p.ipmName, responseCode, debugMode);
+            }
+            throw e;
+            
+        } catch (Exception e) {
+            if (cfg.miplog != null) {
+                logTransmission(cfg.miplog, p.ipmName, responseCode, debugMode);
+            }
+            throw e;
+        }
+    }
+
+    /* ========================================================================
+     * MODO RECEIVE - Recepcion de archivos FROM Mastercard
+     * ======================================================================== */
+
+    public static void executeReceive(MipParams p, MipConfig cfg, boolean debugMode) throws Exception {
+        System.out.println("\n==============================================");
+        System.out.println("MODO RECEIVE - Recepcion desde Mastercard");
+        System.out.println("==============================================");
+
+        MipFileTransfer.MipTransferResult result = null;
+        String responseCode = "9989999";
+        
+        try {
+            System.out.println("[1/4] Conectando al MIP y solicitando archivo...");
+            
+            result = MipFileTransfer.receiveFromMip(p.ip, p.port, "auto", p.ipmName, p.date);
+            responseCode = result.responseCode;
+            
+        } catch (MipFileTransfer.MipException e) {
+            responseCode = e.responseCode;
+            if (cfg.miplog != null) {
+                logTransmission(cfg.miplog, p.ipmName, responseCode, debugMode);
+            }
+            throw e;
+            
+        } catch (Exception e) {
+            if (cfg.miplog != null) {
+                logTransmission(cfg.miplog, p.ipmName, responseCode, debugMode);
+            }
+            throw e;
+        }
+
+        if (result == null || result.transmissionId == null) {
+            if (cfg.miplog != null) {
+                logTransmission(cfg.miplog, p.ipmName, responseCode, debugMode);
+            }
+            throw new Exception("No se pudo descargar el archivo desde el MIP");
+        }
+
+        String downloadedFileName = result.transmissionId + ".EBCDIC";
+        File downloadedIpmFile = new File(downloadedFileName);
+        
+        if (!downloadedIpmFile.exists()) {
+            if (cfg.miplog != null) {
+                logTransmission(cfg.miplog, result.transmissionId, "9989999", debugMode);
+            }
+            throw new FileNotFoundException("Archivo descargado no encontrado: " + downloadedFileName);
+        }
+
+        System.out.println("Archivo descargado: " + downloadedIpmFile.getName());
+
+        String headerName = result.transmissionId;
+
+        if (DEBUG || debugMode) {
+            System.out.println("DEBUG: Header a insertar: [" + headerName + "]");
+        }
+
+        System.out.println("[2/4] Procesando archivo...");
+
+        String finalDestinationPath;
+        
+        if ("auto".equalsIgnoreCase(p.file)) {
+            if (cfg.autoNameReceive == null || cfg.autoNameReceive.trim().isEmpty()) {
+                throw new IllegalArgumentException(
+                    "Modo 'auto' requiere la configuracion 'autoNameReceive' en mipmanager.ini");
+            }
+            
+            finalDestinationPath = resolveAutoNamePattern(
+                cfg.autoNameReceive, 
+                result.transmissionId, 
+                p.date,
+                p.encode,
+                debugMode
+            );
+            
+            System.out.println("Modo AUTO: Nombre generado: " + finalDestinationPath);
+        } else {
+            finalDestinationPath = p.file;
+        }
+
+        try {
+            if ("EBCDIC".equalsIgnoreCase(p.encode)) {
+                System.out.println("Modo EBCDIC: Copiando contenido con header...");
+                prependHeaderAndCopy(downloadedIpmFile, finalDestinationPath, headerName);
+                System.out.println("Archivo guardado: " + finalDestinationPath);
+
+            } else if ("ASCII".equalsIgnoreCase(p.encode)) {
+                System.out.println("Modo ASCII: Decodificando IPM...");
+                convertIpmToAscii(downloadedIpmFile.getAbsolutePath(), 
+                    finalDestinationPath, headerName, result.transmissionId, debugMode);
+                System.out.println("Archivo guardado: " + finalDestinationPath);
+
+            } else {
+                throw new IllegalArgumentException("Valor invalido para --encode: " + p.encode);
+            }
+
+            System.out.println("[3/4] Limpiando archivos temporales...");
+            if (downloadedIpmFile.exists()) {
+                downloadedIpmFile.delete();
+                if (DEBUG || debugMode) {
+                    System.out.println("DEBUG: Eliminado: " + downloadedIpmFile.getName());
+                }
+            }
+
+            System.out.println("\n==============================================");
+            System.out.println("RECEPCION COMPLETADA EXITOSAMENTE");
+            System.out.println("Archivo: " + finalDestinationPath);
+            System.out.println("==============================================");
+
+            if (cfg.miplog != null) {
+                logTransmission(cfg.miplog, result.transmissionId, result.responseCode, debugMode);
+            }
+
+        } catch (Exception e) {
+            if (cfg.miplog != null) {
+                logTransmission(cfg.miplog, result.transmissionId, "9989999", debugMode);
+            }
+            throw e;
+        }
+    }
+
+    /* ========================================================================
+     * CONVERSION
+     * ======================================================================== */
+
+    private static void convertAsciiToIpm(String inputAscii, String outputIpm, 
+            String ipmName, boolean debugMode) throws Exception {
+        
+        boolean isIpmWithRdw = isIpmFileType(ipmName);
+        
+        if (DEBUG || debugMode) {
+            System.out.println("DEBUG: Tipo de archivo: " + 
+                (isIpmWithRdw ? "IPM con RDW" : "EBCDIC plano"));
+        }
+
+        if (isIpmWithRdw) {
+            IpmConverter.runEncodeIpm(inputAscii, outputIpm);
+        } else {
+            IpmConverter.runEncode(inputAscii, outputIpm);
+        }
+    }
+
+    private static void convertIpmToAscii(String inputIpm, String finalOutputFile, 
+            String headerName, String fileName, boolean debugMode) throws Exception {
+        
+        boolean isIpmWithRdw = isIpmFileType(fileName);
+        
+        if (DEBUG || debugMode) {
+            System.out.println("DEBUG: Tipo de archivo: " + 
+                (isIpmWithRdw ? "IPM con RDW" : "EBCDIC plano"));
+        }
+
+        File tempAsciiFile = null;
+        try {
+            tempAsciiFile = File.createTempFile("decoded_ascii_", ".txt");
+            if (DEBUG || debugMode) {
+                System.out.println("DEBUG: Temporal ASCII: " + tempAsciiFile.getAbsolutePath());
+            }
+
+            if (isIpmWithRdw) {
+                IpmConverter.runDecodeIpm(inputIpm, tempAsciiFile.getAbsolutePath());
+            } else {
+                IpmConverter.runDecode(inputIpm, tempAsciiFile.getAbsolutePath());
+            }
+            
+            System.out.println("Decodificacion completada");
+            System.out.println("Escribiendo archivo final con header...");
+            
+            try (FileOutputStream fos = new FileOutputStream(finalOutputFile);
+                 FileInputStream fis = new FileInputStream(tempAsciiFile)) {
+
+                String headerLine = "[" + headerName + "]" + System.lineSeparator();
+                fos.write(headerLine.getBytes());
+
+                byte[] buffer = new byte[8192];
+                int n;
+                while ((n = fis.read(buffer)) > 0) {
+                    fos.write(buffer, 0, n);
+                }
+            }
+
+        } finally {
+            if (tempAsciiFile != null && tempAsciiFile.exists()) {
+                if (DEBUG || debugMode) {
+                    System.out.println("DEBUG: Eliminando temporal ASCII: " + tempAsciiFile.getName());
+                }
+                tempAsciiFile.delete();
+            }
+        }
+    }
+
+    /* ========================================================================
+     * AUTO-NAMING
+     * ======================================================================== */
+
+    private static String resolveAutoNamePattern(String pattern, String transmissionId, 
+            String date, String encode, boolean debugMode) {
+        
+        String result = pattern;
+        
+        String firstFour = transmissionId.length() >= 4 ? 
+            transmissionId.substring(0, 4) : transmissionId;
+        
+        result = result.replace("TXXX", firstFour);
+        
+        String dateToUse;
+        
+        if (date != null && date.matches("\\d{8}")) {
+            dateToUse = date;
+            if (DEBUG || debugMode) {
+                System.out.println("DEBUG: Usando fecha proporcionada: " + date);
+            }
+        } else if (transmissionId.length() == 14) {
+            try {
+                String yearAndJulian = transmissionId.substring(5, 10);
+                int yy = Integer.parseInt(yearAndJulian.substring(0, 2));
+                int julianDay = Integer.parseInt(yearAndJulian.substring(2, 5));
+                
+                int year = 2000 + yy;
+                dateToUse = julianDayToDate(year, julianDay);
+                
+                if (DEBUG || debugMode) {
+                    System.out.println("DEBUG: Fecha extraida del transmission ID:");
+                    System.out.println("DEBUG:   YY = " + yy + ", JJJ = " + julianDay);
+                    System.out.println("DEBUG:   Año = " + year);
+                    System.out.println("DEBUG:   Fecha convertida: " + dateToUse);
+                }
+                
+            } catch (Exception e) {
+                SimpleDateFormat sdf = new SimpleDateFormat("yyyyMMdd");
+                dateToUse = sdf.format(new Date());
+                
+                if (DEBUG || debugMode) {
+                    System.out.println("DEBUG: Error extrayendo fecha, usando actual: " + dateToUse);
+                }
+            }
+        } else {
+            SimpleDateFormat sdf = new SimpleDateFormat("yyyyMMdd");
+            dateToUse = sdf.format(new Date());
+            
+            if (DEBUG || debugMode) {
+                System.out.println("DEBUG: Usando fecha actual: " + dateToUse);
+            }
+        }
+        
+        result = result.replace("AAAAMMDD", dateToUse);
+        
+        if (!result.contains(".")) {
+            if ("ASCII".equalsIgnoreCase(encode)) {
+                result += ".txt";
+            } else if ("EBCDIC".equalsIgnoreCase(encode)) {
+                result += ".ipm";
+            }
+        }
+        
+        if (DEBUG || debugMode) {
+            System.out.println("DEBUG: Patron original: " + pattern);
+            System.out.println("DEBUG: TXXX -> " + firstFour);
+            System.out.println("DEBUG: AAAAMMDD -> " + dateToUse);
+            System.out.println("DEBUG: Resultado: " + result);
+        }
+        
+        return result;
+    }
+
+    private static String julianDayToDate(int year, int julianDay) {
+        if (julianDay < 1 || julianDay > 366) {
+            throw new IllegalArgumentException("Dia juliano invalido: " + julianDay);
+        }
+        
+        boolean isLeapYear = (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0);
+        
+        int[] daysInMonth = {
+            31, isLeapYear ? 29 : 28, 31, 30, 31, 30,
+            31, 31, 30, 31, 30, 31
+        };
+        
+        int month = 1;
+        int dayOfMonth = julianDay;
+        
+        for (int i = 0; i < daysInMonth.length; i++) {
+            if (dayOfMonth <= daysInMonth[i]) {
+                month = i + 1;
+                break;
+            }
+            dayOfMonth -= daysInMonth[i];
+        }
+        
+        return String.format("%04d%02d%02d", year, month, dayOfMonth);
+    }
+
+    /* ========================================================================
+     * LOGGING
+     * ======================================================================== */
+
+    private static void logTransmission(String logPath, String transmissionId, 
+            String responseCode, boolean debugMode) {
+        try (FileWriter fw = new FileWriter(logPath, true)) {
+            SimpleDateFormat sdf = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss");
+            String timestamp = sdf.format(new Date());
+            
+            String logEntry = "[" + responseCode + "-" + transmissionId + 
+                ": " + timestamp + "]" + System.lineSeparator();
+            
+            fw.write(logEntry);
+            
+            if (DEBUG || debugMode) {
+                System.out.println("DEBUG: Log registrado: " + logEntry.trim());
+            }
+            
+        } catch (IOException e) {
+            System.err.println("ADVERTENCIA: No se pudo escribir en el log: " + e.getMessage());
+        }
+    }
+
+    /* ========================================================================
+     * UTILIDADES
+     * ======================================================================== */
+
+    private static boolean isIpmFileType(String fileName) {
+        String name = fileName.toUpperCase();
+        
+        if (name.contains("R111") || name.contains("R119") || 
+            name.contains("RSP1") || name.contains("RSP3")) {
+            return true;
+        }
+        
+        if (name.contains("T112") || name.contains("T120")) {
+            return true;
+        }
+        
+        if (name.contains("T007") || name.contains("T113") || name.contains("T121") ||
+            name.contains("T140") || name.contains("T150")) {
+            return false;
+        }
+        
+        if (name.contains("T067") || name.contains("T068") ||
+            name.contains("T167") || name.contains("T168")) {
+            return false;
+        }
+        
+        return true;
+    }
+
+    private static File createTempFile(String prefix) throws IOException {
+        SimpleDateFormat sdf = new SimpleDateFormat("yyyyMMddHHmmss");
+        String timestamp = sdf.format(new Date());
+        
+        String fileName = prefix + "_" + timestamp + ".ipm";
+        return new File(fileName);
+    }
+
+    private static void prependHeaderAndCopy(File sourceFile, String destPath, 
+            String headerName) throws IOException {
+        
+        try (FileOutputStream fos = new FileOutputStream(destPath);
+             FileInputStream fis = new FileInputStream(sourceFile)) {
+
+            String headerLine = "[" + headerName + "]" + System.lineSeparator();
+            fos.write(headerLine.getBytes());
+
+            byte[] buffer = new byte[8192];
+            int n;
+            while ((n = fis.read(buffer)) > 0) {
+                fos.write(buffer, 0, n);
+            }
+        }
+    }
+
+    private static void printHelp() {
         System.out.println("=================================================================");
         System.out.println("MipManager v2.1 - Gestor de Transferencias MIP Mastercard");
         System.out.println("=================================================================");
         System.out.println();
-
-        while (true) {
-            System.out.println("\n--- MENU PRINCIPAL ---");
-            System.out.println("(1) Enviar archivo a MIP");
-            System.out.println("(2) Solicitar archivo de MIP");
-            System.out.println();
-            System.out.println("UTILITARIOS ADICIONALES:");
-            System.out.println("(3) Codificar archivo a IPM (EBCDIC + RDW)");
-            System.out.println("(4) Decodificar archivo IPM (EBCDIC + RDW)");
-            System.out.println("(5) Codificar archivo a EBCDIC plano");
-            System.out.println("(6) Decodificar archivo EBCDIC plano");
-            System.out.println();
-            System.out.println("(0) Salir");
-            System.out.println();
-            System.out.print("Seleccione una opcion: ");
-
-            String option = scanner.nextLine().trim();
-
-            if ("0".equals(option)) {
-                System.out.println("Saliendo...");
-                break;
-            }
-
-            try {
-                switch (option) {
-                    case "1":
-                        promptSend(cfg);
-                        break;
-                    case "2":
-                        promptReceive(cfg);
-                        break;
-                    case "3":
-                        promptEncodeIpm();
-                        break;
-                    case "4":
-                        promptDecodeIpm();
-                        break;
-                    case "5":
-                        promptEncodeEbcdic();
-                        break;
-                    case "6":
-                        promptDecodeEbcdic();
-                        break;
-                    default:
-                        System.out.println("Opcion invalida. Intente nuevamente.");
-                }
-            } catch (Exception e) {
-                System.err.println("\nERROR: " + e.getMessage());
-                if (debugMode) {
-                    e.printStackTrace();
-                }
-                System.out.println("Presione ENTER para continuar...");
-                scanner.nextLine();
-            }
-        }
-    }
-
-    /* ========================================================================
-     * OPCION 1: ENVIAR ARCHIVO A MIP
-     * ======================================================================== */
-
-    private static void promptSend(MipConfig cfg) throws Exception {
-        System.out.println("\n=== ENVIAR ARCHIVO A MIP ===");
+        System.out.println("USO:");
+        System.out.println("  Modo interactivo:");
+        System.out.println("    java -jar mipmgr-1.0.0.jar");
         System.out.println();
-
-        // IP
-        System.out.print("IP del MIP: ");
-        String ip = scanner.nextLine().trim();
-
-        // Puerto
-        System.out.print("Puerto del MIP: ");
-        int port = Integer.parseInt(scanner.nextLine().trim());
-
-        // Archivo
-        System.out.print("Archivo a enviar (ruta): ");
-        String file = scanner.nextLine().trim();
-
-        File sourceFile = new File(file);
-        if (!sourceFile.exists()) {
-            throw new FileNotFoundException("Archivo no encontrado: " + file);
-        }
-
-        // IPM Name
-        System.out.print("IPM Name (9 chars: R11902840 o 14 chars completo): ");
-        String ipmName = scanner.nextLine().trim();
-
-        // Validar longitud
-        if (ipmName.length() != 9 && ipmName.length() != 14) {
-            throw new IllegalArgumentException("IPM Name debe tener 9 o 14 caracteres");
-        }
-
-        // Fecha - Solo si es de 9 caracteres
-        String date = null;
-        if (ipmName.length() == 9) {
-            System.out.print("Fecha (YYYYMMDD, Ej: 20260116): ");
-            date = scanner.nextLine().trim();
-            if (!date.matches("\\d{8}")) {
-                throw new IllegalArgumentException("Formato de fecha invalido. Use YYYYMMDD");
-            }
-        } else {
-            System.out.println("  (Fecha no necesaria - ID completo detectado)");
-        }
-
-        // Encode
-        System.out.println("Formato del archivo:");
-        System.out.println("  (1) ASCII - Requiere conversion a IPM");
-        System.out.println("  (2) EBCDIC - Archivo IPM ya construido");
-        System.out.print("Seleccione: ");
-        String encodeOption = scanner.nextLine().trim();
-        String encode = "1".equals(encodeOption) ? "ASCII" : "EBCDIC";
-
-        // Debug
-        System.out.print("Activar modo debug? (S/N): ");
-        String debugOption = scanner.nextLine().trim();
-        debugMode = "S".equalsIgnoreCase(debugOption);
-
-        // Ejecutar envio
-        System.out.println("\n--- Iniciando envio ---");
-        MipParams p = new MipParams();
-        p.mode = "send";
-        p.ip = ip;
-        p.port = port;
-        p.file = file;
-        p.ipmName = ipmName;
-        p.encode = encode;
-        p.date = date;
-
-        MipManager.executeSend(p, cfg, debugMode);
-        
-        System.out.println("\nPresione ENTER para continuar...");
-        scanner.nextLine();
-    }
-
-    /* ========================================================================
-     * OPCION 2: SOLICITAR ARCHIVO DE MIP
-     * ======================================================================== */
-
-    private static void promptReceive(MipConfig cfg) throws Exception {
-        System.out.println("\n=== SOLICITAR ARCHIVO DE MIP ===");
+        System.out.println("  Modo linea de comandos:");
+        System.out.println("    java -jar mipmgr-1.0.0.jar [PARAMETROS]");
         System.out.println();
-
-        // IP
-        System.out.print("IP del MIP: ");
-        String ip = scanner.nextLine().trim();
-
-        // Puerto
-        System.out.print("Puerto del MIP: ");
-        int port = Integer.parseInt(scanner.nextLine().trim());
-
-        // IPM Name
-        System.out.print("IPM Name (9 chars: T112 o 14 chars completo): ");
-        String ipmName = scanner.nextLine().trim();
-
-        // Validar longitud
-        if (ipmName.length() != 9 && ipmName.length() != 14) {
-            throw new IllegalArgumentException("IPM Name debe tener 9 o 14 caracteres");
-        }
-
-        // Fecha - Solo si es de 9 caracteres
-        String date;
-        if (ipmName.length() == 9) {
-            System.out.print("Fecha (YYYYMMDD, Ej: 20260116): ");
-            date = scanner.nextLine().trim();
-            if (!date.matches("\\d{8}")) {
-                throw new IllegalArgumentException("Formato de fecha invalido. Use YYYYMMDD");
-            }
-        } else {
-            System.out.println("  (Fecha no necesaria - ID completo detectado)");
-            date = null; // Se extraerá del transmission ID
-        }
-
-        // Archivo destino
-        System.out.print("Archivo destino - Generar automatico? (S/N): ");
-        String autoMode = scanner.nextLine().trim();
-
-        String file;
-        if ("S".equalsIgnoreCase(autoMode)) {
-            file = "auto";
-            System.out.println("  Se usara patron del mipmanager.ini: autoNameReceive");
-        } else {
-            System.out.print("Especifique ruta del archivo: ");
-            file = scanner.nextLine().trim();
-        }
-
-        // Encode
-        System.out.println("Formato del archivo a guardar:");
-        System.out.println("  (1) ASCII - Convierte IPM a texto plano");
-        System.out.println("  (2) EBCDIC - Mantiene formato IPM original");
-        System.out.print("Seleccione: ");
-        String encodeOption = scanner.nextLine().trim();
-        String encode = "1".equals(encodeOption) ? "ASCII" : "EBCDIC";
-
-        // Debug
-        System.out.print("Activar modo debug? (S/N): ");
-        String debugOption = scanner.nextLine().trim();
-        debugMode = "S".equalsIgnoreCase(debugOption);
-
-        // Ejecutar recepcion
-        System.out.println("\n--- Iniciando recepcion ---");
-        MipParams p = new MipParams();
-        p.mode = "receive";
-        p.ip = ip;
-        p.port = port;
-        p.file = file;
-        p.ipmName = ipmName;
-        p.date = date;
-        p.encode = encode;
-
-        MipManager.executeReceive(p, cfg, debugMode);
-        
-        System.out.println("\nPresione ENTER para continuar...");
-        scanner.nextLine();
-    }
-
-    /* ========================================================================
-     * OPCION 3: CODIFICAR ARCHIVO A IPM (EBCDIC + RDW)
-     * ======================================================================== */
-
-    private static void promptEncodeIpm() throws Exception {
-        System.out.println("\n=== CODIFICAR ARCHIVO A IPM (EBCDIC + RDW) ===");
-        System.out.println("Convierte archivo ASCII a formato IPM con estructura RDW");
+        System.out.println("PARAMETROS:");
+        System.out.println("  --mode <send|receive>   Modo de operacion");
+        System.out.println("  --ip <direccion>        IP del MIP");
+        System.out.println("  --port <puerto>         Puerto del MIP");
+        System.out.println("  --file <path|auto>      Archivo");
+        System.out.println("  --encode <EBCDIC|ASCII> Formato");
+        System.out.println("  --ipmname <id>          Transmission ID");
+        System.out.println("  --date <YYYYMMDD>       Fecha (opcional si ID es 14 chars)");
         System.out.println();
-
-        System.out.print("Archivo origen (ASCII): ");
-        String inputFile = scanner.nextLine().trim();
-
-        File input = new File(inputFile);
-        if (!input.exists()) {
-            throw new FileNotFoundException("Archivo no encontrado: " + inputFile);
-        }
-
-        System.out.print("Archivo destino (IPM): ");
-        String outputFile = scanner.nextLine().trim();
-
-        System.out.print("Activar modo debug? (S/N): ");
-        String debugOption = scanner.nextLine().trim();
-        debugMode = "S".equalsIgnoreCase(debugOption);
-
-        System.out.println("\n--- Codificando ---");
-        IpmConverter.runEncodeIpm(inputFile, outputFile);
-        
-        System.out.println("\nArchivo codificado exitosamente: " + outputFile);
-        System.out.println("Presione ENTER para continuar...");
-        scanner.nextLine();
-    }
-
-    /* ========================================================================
-     * OPCION 4: DECODIFICAR ARCHIVO IPM (EBCDIC + RDW)
-     * ======================================================================== */
-
-    private static void promptDecodeIpm() throws Exception {
-        System.out.println("\n=== DECODIFICAR ARCHIVO IPM (EBCDIC + RDW) ===");
-        System.out.println("Convierte archivo IPM con RDW a formato ASCII");
-        System.out.println();
-
-        System.out.print("Archivo origen (IPM): ");
-        String inputFile = scanner.nextLine().trim();
-
-        File input = new File(inputFile);
-        if (!input.exists()) {
-            throw new FileNotFoundException("Archivo no encontrado: " + inputFile);
-        }
-
-        System.out.print("Archivo destino (ASCII): ");
-        String outputFile = scanner.nextLine().trim();
-
-        System.out.print("Activar modo debug? (S/N): ");
-        String debugOption = scanner.nextLine().trim();
-        debugMode = "S".equalsIgnoreCase(debugOption);
-
-        System.out.println("\n--- Decodificando ---");
-        IpmConverter.runDecodeIpm(inputFile, outputFile);
-        
-        System.out.println("\nArchivo decodificado exitosamente: " + outputFile);
-        System.out.println("Presione ENTER para continuar...");
-        scanner.nextLine();
-    }
-
-    /* ========================================================================
-     * OPCION 5: CODIFICAR ARCHIVO A EBCDIC PLANO
-     * ======================================================================== */
-
-    private static void promptEncodeEbcdic() throws Exception {
-        System.out.println("\n=== CODIFICAR ARCHIVO A EBCDIC PLANO ===");
-        System.out.println("Convierte archivo ASCII a EBCDIC sin estructura RDW");
-        System.out.println();
-
-        System.out.print("Archivo origen (ASCII): ");
-        String inputFile = scanner.nextLine().trim();
-
-        File input = new File(inputFile);
-        if (!input.exists()) {
-            throw new FileNotFoundException("Archivo no encontrado: " + inputFile);
-        }
-
-        System.out.print("Archivo destino (EBCDIC): ");
-        String outputFile = scanner.nextLine().trim();
-
-        System.out.print("Activar modo debug? (S/N): ");
-        String debugOption = scanner.nextLine().trim();
-        debugMode = "S".equalsIgnoreCase(debugOption);
-
-        System.out.println("\n--- Codificando ---");
-        IpmConverter.runEncode(inputFile, outputFile);
-        
-        System.out.println("\nArchivo codificado exitosamente: " + outputFile);
-        System.out.println("Presione ENTER para continuar...");
-        scanner.nextLine();
-    }
-
-    /* ========================================================================
-     * OPCION 6: DECODIFICAR ARCHIVO EBCDIC PLANO
-     * ======================================================================== */
-
-    private static void promptDecodeEbcdic() throws Exception {
-        System.out.println("\n=== DECODIFICAR ARCHIVO EBCDIC PLANO ===");
-        System.out.println("Convierte archivo EBCDIC plano a ASCII");
-        System.out.println();
-
-        System.out.print("Archivo origen (EBCDIC): ");
-        String inputFile = scanner.nextLine().trim();
-
-        File input = new File(inputFile);
-        if (!input.exists()) {
-            throw new FileNotFoundException("Archivo no encontrado: " + inputFile);
-        }
-
-        System.out.print("Archivo destino (ASCII): ");
-        String outputFile = scanner.nextLine().trim();
-
-        System.out.print("Activar modo debug? (S/N): ");
-        String debugOption = scanner.nextLine().trim();
-        debugMode = "S".equalsIgnoreCase(debugOption);
-
-        System.out.println("\n--- Decodificando ---");
-        IpmConverter.runDecode(inputFile, outputFile);
-        
-        System.out.println("\nArchivo decodificado exitosamente: " + outputFile);
-        System.out.println("Presione ENTER para continuar...");
-        scanner.nextLine();
+        System.out.println("DEBUG:");
+        System.out.println("  java -Dmip.debug=true -jar mipmgr-1.0.0.jar");
+        System.out.println("=================================================================");
     }
 }
