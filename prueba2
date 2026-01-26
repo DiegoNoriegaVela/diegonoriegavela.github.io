@@ -1,204 +1,55 @@
-package com.scotiabank.mip;
-
-import java.io.*;
-
 /**
- * MipReportFormatter - Formateador de Reportes MIP
- * 
- * Aplica reglas de formateo específicas para cada tipo de archivo IPM
- * al convertir de EBCDIC a ASCII, generando reportes legibles.
- * 
- * Tipos soportados:
- * - T112, T120: Archivos IPM estándar (sin formateo especial)
- * - T150: Reporte de excepciones (830 caracteres por línea)
- * - T007, T113, T121, T140: Reportes estándar
- * 
- * @author Sistema de Integracion Mastercard
- * @version 1.0
- * @package com.scotiabank.mip
+ * Convierte archivo IPM a ASCII usando IpmConverter y aplica formateo de reporte
+ * Detecta automaticamente si usar decodeipm o decode
  */
-public class MipReportFormatter {
+private static void convertIpmToAscii(String inputIpm, String finalOutputFile, 
+        String headerName, String fileName, boolean debugMode) throws Exception {
+    
+    boolean isIpmWithRdw = isIpmFileType(fileName);
+    
+    if (DEBUG || debugMode) {
+        System.out.println("DEBUG: Tipo de archivo: " + 
+            (isIpmWithRdw ? "IPM con RDW" : "EBCDIC plano"));
+    }
 
-    private static final boolean DEBUG = Boolean.getBoolean("mip.debug");
-
-    /**
-     * Formatea un archivo ASCII según el tipo de reporte
-     * 
-     * @param transmissionId ID de transmisión completo (ej: T1500284001601)
-     * @param inputAsciiFile Archivo ASCII sin formatear
-     * @param outputFile Archivo de salida formateado con header
-     * @param debugMode Activar mensajes debug
-     * @throws Exception Si ocurre error en formateo
-     */
-    public static void formatReport(String transmissionId, File inputAsciiFile, 
-            String outputFile, boolean debugMode) throws Exception {
-        
-        // Extraer tipo de reporte (primeros 4 caracteres)
-        String reportType = transmissionId.length() >= 4 ? 
-            transmissionId.substring(0, 4).toUpperCase() : transmissionId;
-        
+    File tempAsciiFile = null;
+    try {
+        // 1. Crear archivo temporal para salida de conversion
+        tempAsciiFile = File.createTempFile("decoded_ascii_", ".txt");
         if (DEBUG || debugMode) {
-            System.out.println("DEBUG: Tipo de reporte detectado: " + reportType);
+            System.out.println("DEBUG: Temporal ASCII (sin formatear): " + tempAsciiFile.getAbsolutePath());
         }
 
-        // Aplicar regla de formateo según tipo
-        if ("T150".equals(reportType)) {
-            formatT150Report(transmissionId, inputAsciiFile, outputFile, debugMode);
-        } else if ("T112".equals(reportType) || "T120".equals(reportType)) {
-            formatStandardIpmReport(transmissionId, inputAsciiFile, outputFile, debugMode);
-        } else if ("T007".equals(reportType) || "T113".equals(reportType) || 
-                   "T121".equals(reportType) || "T140".equals(reportType)) {
-            formatStandardReport(transmissionId, inputAsciiFile, outputFile, debugMode);
+        // 2. Ejecutar conversion EBCDIC -> ASCII
+        if (isIpmWithRdw) {
+            IpmConverter.runDecodeIpm(inputIpm, tempAsciiFile.getAbsolutePath());
         } else {
-            // Tipo desconocido - formateo estándar
-            if (DEBUG || debugMode) {
-                System.out.println("DEBUG: Tipo desconocido, usando formateo estándar");
-            }
-            formatStandardReport(transmissionId, inputAsciiFile, outputFile, debugMode);
+            IpmConverter.runDecode(inputIpm, tempAsciiFile.getAbsolutePath());
         }
-    }
-
-    /**
-     * Formatea reporte T150 (Excepciones)
-     * Regla: Cortar cada 830 caracteres por línea
-     */
-    private static void formatT150Report(String transmissionId, File inputFile, 
-            String outputFile, boolean debugMode) throws Exception {
         
+        System.out.println("Decodificacion completada");
+
+        // 3. Aplicar formateo de reporte (incluye header y reglas específicas)
+        System.out.println("Aplicando formateo de reporte...");
+        
+        // Obtener descripción del formateo
+        String formattingDesc = MipReportFormatter.getFormattingDescription(headerName);
         if (DEBUG || debugMode) {
-            System.out.println("DEBUG: Aplicando formato T150 (830 chars/linea)");
+            System.out.println("DEBUG: Formato: " + formattingDesc);
         }
-
-        try (BufferedReader reader = new BufferedReader(new FileReader(inputFile));
-             PrintWriter writer = new PrintWriter(new FileWriter(outputFile))) {
-
-            // Escribir header
-            writer.println("[" + transmissionId + "]");
-
-            // Leer todo el contenido
-            StringBuilder content = new StringBuilder();
-            String line;
-            while ((line = reader.readLine()) != null) {
-                content.append(line);
-            }
-
-            String fullText = content.toString();
-            
-            if (DEBUG || debugMode) {
-                System.out.println("DEBUG: Longitud total del texto: " + fullText.length());
-            }
-
-            // Cortar en bloques de 830 caracteres
-            int charsPerLine = 830;
-            int totalChars = fullText.length();
-            int linesWritten = 0;
-
-            for (int i = 0; i < totalChars; i += charsPerLine) {
-                int end = Math.min(i + charsPerLine, totalChars);
-                String chunk = fullText.substring(i, end);
-                writer.println(chunk);
-                linesWritten++;
-            }
-
-            if (DEBUG || debugMode) {
-                System.out.println("DEBUG: Líneas escritas: " + linesWritten);
-            }
-        }
-    }
-
-    /**
-     * Formatea reportes IPM estándar (T112, T120)
-     * Regla: Solo agregar header, mantener estructura original
-     */
-    private static void formatStandardIpmReport(String transmissionId, File inputFile, 
-            String outputFile, boolean debugMode) throws Exception {
         
-        if (DEBUG || debugMode) {
-            System.out.println("DEBUG: Aplicando formato IPM estándar (preservar estructura)");
-        }
+        // Aplicar formateo según tipo de reporte
+        MipReportFormatter.formatReport(headerName, tempAsciiFile, finalOutputFile, debugMode);
+        
+        System.out.println("Formateo de reporte completado");
 
-        try (BufferedReader reader = new BufferedReader(new FileReader(inputFile));
-             PrintWriter writer = new PrintWriter(new FileWriter(outputFile))) {
-
-            // Escribir header
-            writer.println("[" + transmissionId + "]");
-
-            // Copiar contenido línea por línea
-            String line;
-            int linesWritten = 0;
-            while ((line = reader.readLine()) != null) {
-                writer.println(line);
-                linesWritten++;
-            }
-
+    } finally {
+        // 4. Limpiar temporal
+        if (tempAsciiFile != null && tempAsciiFile.exists()) {
             if (DEBUG || debugMode) {
-                System.out.println("DEBUG: Líneas copiadas: " + linesWritten);
+                System.out.println("DEBUG: Eliminando temporal ASCII: " + tempAsciiFile.getName());
             }
-        }
-    }
-
-    /**
-     * Formatea reportes estándar (T007, T113, T121, T140)
-     * Regla: Agregar header y mantener formato original
-     */
-    private static void formatStandardReport(String transmissionId, File inputFile, 
-            String outputFile, boolean debugMode) throws Exception {
-        
-        if (DEBUG || debugMode) {
-            System.out.println("DEBUG: Aplicando formato estándar");
-        }
-
-        try (BufferedReader reader = new BufferedReader(new FileReader(inputFile));
-             PrintWriter writer = new PrintWriter(new FileWriter(outputFile))) {
-
-            // Escribir header
-            writer.println("[" + transmissionId + "]");
-
-            // Copiar contenido línea por línea
-            String line;
-            int linesWritten = 0;
-            while ((line = reader.readLine()) != null) {
-                writer.println(line);
-                linesWritten++;
-            }
-
-            if (DEBUG || debugMode) {
-                System.out.println("DEBUG: Líneas copiadas: " + linesWritten);
-            }
-        }
-    }
-
-    /**
-     * Valida si un tipo de reporte requiere formateo especial
-     */
-    public static boolean requiresSpecialFormatting(String transmissionId) {
-        String reportType = transmissionId.length() >= 4 ? 
-            transmissionId.substring(0, 4).toUpperCase() : transmissionId;
-        
-        // Solo T150 requiere formateo especial por ahora
-        return "T150".equals(reportType);
-    }
-
-    /**
-     * Obtiene la descripción del formateo aplicado
-     */
-    public static String getFormattingDescription(String transmissionId) {
-        String reportType = transmissionId.length() >= 4 ? 
-            transmissionId.substring(0, 4).toUpperCase() : transmissionId;
-        
-        switch (reportType) {
-            case "T150":
-                return "Reporte de Excepciones (830 caracteres por línea)";
-            case "T112":
-            case "T120":
-                return "Archivo IPM estándar (estructura preservada)";
-            case "T007":
-            case "T113":
-            case "T121":
-            case "T140":
-                return "Reporte estándar";
-            default:
-                return "Formato estándar";
+            tempAsciiFile.delete();
         }
     }
 }
