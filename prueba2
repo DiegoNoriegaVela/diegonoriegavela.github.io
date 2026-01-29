@@ -1,12 +1,12 @@
 /**
  * Formatea reporte T150 (Excepciones)
- * Regla: Líneas de 134 caracteres, EXCEPTO cuando encuentra "1IP" que fuerza nueva línea
+ * Regla: Cada línea tiene exactamente 133 caracteres
  */
 private static void formatT150Report(String transmissionId, File inputFile, 
         String outputFile, boolean debugMode) throws Exception {
     
     if (DEBUG || debugMode) {
-        System.out.println("DEBUG: Aplicando formato T150 (134 chars/línea, '1IP' fuerza nueva línea)");
+        System.out.println("DEBUG: Aplicando formato T150 (133 caracteres por línea)");
     }
 
     try (BufferedReader reader = new BufferedReader(new FileReader(inputFile));
@@ -28,50 +28,21 @@ private static void formatT150Report(String transmissionId, File inputFile,
             System.out.println("DEBUG: Longitud total del texto: " + fullText.length());
         }
 
+        // Cortar en bloques de 133 caracteres
+        int charsPerLine = 133;
+        int totalChars = fullText.length();
         int linesWritten = 0;
-        int position = 0;
-        int totalLength = fullText.length();
 
-        while (position < totalLength) {
-            // Calcular cuántos caracteres quedan
-            int remaining = totalLength - position;
-            
-            // Determinar cuántos caracteres tomar (máximo 134)
-            int charsToTake = Math.min(134, remaining);
-            
-            // Extraer el fragmento candidato
-            String candidate = fullText.substring(position, position + charsToTake);
-            
-            // Buscar "1IP" dentro de este fragmento (excepto al inicio)
-            int ipmIndex = candidate.indexOf("1IP", 1); // Buscar desde posición 1, no desde 0
-            
-            String recordLine;
-            
-            if (ipmIndex != -1) {
-                // Se encontró "1IP" dentro del fragmento
-                // Cortar ANTES del "1IP" encontrado
-                recordLine = candidate.substring(0, ipmIndex);
-                position += ipmIndex; // Avanzar hasta el "1IP"
-                
-                if (DEBUG || debugMode) {
-                    System.out.println("DEBUG: '1IP' encontrado en pos " + ipmIndex + 
-                        ", cortando línea en " + recordLine.length() + " chars");
-                }
-            } else {
-                // No se encontró "1IP", tomar los 134 caracteres completos
-                recordLine = candidate;
-                position += charsToTake;
-            }
-            
-            // Escribir la línea (puede tener menos de 134 si se encontró "1IP")
-            writer.println(recordLine);
+        for (int i = 0; i < totalChars; i += charsPerLine) {
+            int end = Math.min(i + charsPerLine, totalChars);
+            String chunk = fullText.substring(i, end);
+            writer.println(chunk);
             linesWritten++;
             
-            if (DEBUG || debugMode) {
-                String preview = recordLine.length() > 40 ? 
-                    recordLine.substring(0, 40) + "..." : recordLine;
-                System.out.println("DEBUG: Línea " + linesWritten + ": " + 
-                    recordLine.length() + " chars - Inicia: \"" + preview + "\"");
+            if (DEBUG || debugMode && linesWritten <= 5) {
+                String preview = chunk.length() > 40 ? chunk.substring(0, 40) + "..." : chunk;
+                System.out.println("DEBUG: Línea " + linesWritten + ": " + chunk.length() + 
+                    " chars - \"" + preview + "\"");
             }
         }
 
