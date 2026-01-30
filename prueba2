@@ -14,14 +14,15 @@
 #include "fts_headers.h"
 #include <sys/utsname.h>
 #include <sys/wait.h>
+
 #include "pt_switch.h"
 
 /*Declaracion de parrafos o funciones*/
-static int read_card();
+static int read_card(void);
 static void hot_exit(int n);
-static void print_card_info();
-static void abrir_archivo();
-static int contar_registros();
+static void print_card_info(void);
+static void abrir_archivo(void);
+static int contar_registros(void);
 
 /* Declaracion de Variables*/
 char pan[50];
@@ -140,14 +141,16 @@ int main(int argc, char **argv, char **env)
     
     /* Unir archivos */
     printf("\nUniendo archivos...\n");
-    char cmd[512];
-    sprintf(cmd, "cat %s/tabcard_*.txt > %s/tabcard_final.txt 2>/dev/null",
-            getenv("LOGDIR"), getenv("LOGDIR"));
-    system(cmd);
-    
-    /* Limpiar archivos temporales */
-    sprintf(cmd, "rm -f %s/tabcard_[0-9]*.txt 2>/dev/null", getenv("LOGDIR"));
-    system(cmd);
+    {
+        char cmd[512];
+        sprintf(cmd, "cat %s/tabcard_*.txt > %s/tabcard_final.txt 2>/dev/null",
+                getenv("LOGDIR"), getenv("LOGDIR"));
+        system(cmd);
+        
+        /* Limpiar archivos temporales */
+        sprintf(cmd, "rm -f %s/tabcard_[0-9]*.txt 2>/dev/null", getenv("LOGDIR"));
+        system(cmd);
+    }
     
     printf("\n=== COMPLETADO ===\n");
     printf("Archivo final: %s/tabcard_final.txt\n", getenv("LOGDIR"));
@@ -155,7 +158,7 @@ int main(int argc, char **argv, char **env)
     return 0;
 }
 
-static int contar_registros()
+static int contar_registros(void)
 {
     char command[300];
     ESP_SLOT slot;
@@ -188,7 +191,7 @@ static int contar_registros()
     return total;
 }
 
-static void abrir_archivo()
+static void abrir_archivo(void)
 {
     char filename[100];
     
@@ -206,12 +209,11 @@ static void abrir_archivo()
     if (fp == NULL)
     {
         printf("Could not open file %s\n", filename);
-        fclose(fp);
         exit(1);
     }
 }
 
-static void print_card_info()
+static void print_card_info(void)
 {
     char record[300], *p;
     
@@ -237,11 +239,9 @@ static void print_card_info()
     
     fprintf(fp, "%s \n", record);
     fflush(fp);
-    free(p);
-    free(record);
 }
 
-static int read_card()
+static int read_card(void)
 {
     char command[600];
     int cnttmp = 0;
