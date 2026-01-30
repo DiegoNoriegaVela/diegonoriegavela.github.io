@@ -1,4 +1,6 @@
 /*
+ * #Sistema     : SWITCH ATM
+ * #Subsistema  : Interface
  * #Nombre      : gentabcard
  * #Descripcion : Generacion del archivo Tabcard.txt
  * #Autor       : Cesar Mesta - SES
@@ -11,18 +13,16 @@
  *   ./gentabcard 8         -> Paraleliza en 8 procesos
  */
 
-#include "fts_headers.h"
-#include <sys/utsname.h>
+#include <stdio.h>
 #include <sys/wait.h>
-
-#include "pt_switch.h"
+#include "pt_master.h"
 
 /*Declaracion de parrafos o funciones*/
-static int read_card(void);
+static int read_card();
 static void hot_exit(int n);
-static void print_card_info(void);
-static void abrir_archivo(void);
-static int contar_registros(void);
+static void print_card_info();
+static void abrir_archivo();
+static int contar_registros();
 
 /* Declaracion de Variables*/
 char pan[50];
@@ -80,7 +80,7 @@ int main(int argc, char **argv, char **env)
     
     /* MODO ORIGINAL - sin paralelizar */
     if (!g_modo_paralelo) {
-        plHandleSignals(0, hot_exit);
+        fep_catch_sig(0, hot_exit);
         abrir_archivo();
         read_card();
         return 0;
@@ -124,7 +124,7 @@ int main(int argc, char **argv, char **env)
                    i, g_offset + 1, g_offset + g_cantidad);
             
             sw_logon_database(1);
-            plHandleSignals(0, hot_exit);
+            fep_catch_sig(0, hot_exit);
             abrir_archivo();
             read_card();
             
@@ -158,7 +158,7 @@ int main(int argc, char **argv, char **env)
     return 0;
 }
 
-static int contar_registros(void)
+static int contar_registros()
 {
     char command[300];
     ESP_SLOT slot;
@@ -174,10 +174,10 @@ static int contar_registros(void)
         "WHERE (pan IS NOT NULL) "
         "AND (bin NOT IN ('890507','890502','890506','890530'))");
     
-    pl_log(LOG_DEBUG, "Count query [%s]\n", command);
+    cc_send("Count query [%s]\n", command);
     
     if (esp_read(slotp, "card", command, ESP_LOOK)) {
-        pl_log(LOG_DEBUG, "ESP_READ ERROR: [%s]", (char*)*Last_error);
+        cc_send("ESP_READ ERROR: [%s]", (char*)*Last_error);
         fprintf(stderr, "Error contando registros\n");
         return 0;
     }
@@ -191,7 +191,7 @@ static int contar_registros(void)
     return total;
 }
 
-static void abrir_archivo(void)
+static void abrir_archivo()
 {
     char filename[100];
     
@@ -209,39 +209,42 @@ static void abrir_archivo(void)
     if (fp == NULL)
     {
         printf("Could not open file %s\n", filename);
+        fclose(fp);
         exit(1);
     }
 }
 
-static void print_card_info(void)
+static void print_card_info()
 {
     char record[300], *p;
     
     memset(record, 0, sizeof(record));
     p = record;
     p += sprintf(p, "%-19s", pan);
-    p += sprintf(p, " ");
+    p += sprintf(p, " ");  //Fille 1
     p += sprintf(p, "%c", tracking);
-    p += sprintf(p, " ");
+    p += sprintf(p, " ");  //Fille 2
     p += sprintf(p, "%-12s", offset);
-    p += sprintf(p, " ");
+    p += sprintf(p, " ");  //Fille 3
     p += sprintf(p, "%-4s", pin_offset);
-    p += sprintf(p, " ");
+    p += sprintf(p, " ");  //Fille 4
     p += sprintf(p, "%c", useoffset);
-    p += sprintf(p, " ");
+    p += sprintf(p, " ");  //Fille 5
     p += sprintf(p, "%-8s", date_cp);
-    p += sprintf(p, " ");
+    p += sprintf(p, " ");  //Fille 6
     p += sprintf(p, "%-28s", embossing);
-    p += sprintf(p, " ");
+    p += sprintf(p, " ");  //Fille 7
     p += sprintf(p, "%-10s", birthdate);
-    p += sprintf(p, " ");
+    p += sprintf(p, " ");  //Fille 8
     p += sprintf(p, "%-4s", expdate);
     
     fprintf(fp, "%s \n", record);
     fflush(fp);
+    free(p);
+    free(record);
 }
 
-static int read_card(void)
+static int read_card()
 {
     char command[600];
     int cnttmp = 0;
@@ -275,11 +278,11 @@ static int read_card(void)
             "ORDER BY rowid");
     }
     
-    pl_log(LOG_DEBUG, "Command [%s]\n", command);
+    cc_send("Comand [%s]\n", command);
     
     if (esp_read(slotp, "card", command, ESP_LOOK))
     {
-        pl_log(LOG_DEBUG, "ESP_READ ERROR: [%s]", (char*)*Last_error);
+        cc_send("ESP_READ ERROR: [%s]", (char*)*Last_error);
         fprintf(stderr, "Can't read CARD Table!: %s\n", (char*)*Last_error);
         exit(1);
     }
@@ -301,21 +304,21 @@ static int read_card(void)
         memset(birthdate, '\0', sizeof(birthdate));
         memset(expdate, '\0', sizeof(expdate));
         
-        esp_get(slotp, "tracking", &tracking);
+        esp_get(slotp, "tracking", tracking);
         esp_get(slotp, "offset", offset);
         esp_get(slotp, "pin_offset", pin_offset);
-        esp_get(slotp, "useoffset", &useoffset);
+        esp_get(slotp, "useoffset", useoffset);
         esp_get(slotp, "date_cp", date_cp);
         esp_get(slotp, "embossing", embossing);
         esp_get(slotp, "birthdate", birthdate);
         esp_get(slotp, "exp_date", expdate);
-        esp_get(slotp, "enc_wall", &enc_wall);
+        esp_get(slotp, "enc_wall", enc_wall);
         
         if (enc_wall == 'Y')
         {
             if (esp_get(slotp, "pan", pan, ENCTRUE))
             {
-                pl_log(LOG_DEBUG, "%s", (char*)*Last_error);
+                cc_send("%s", (char*)*Last_error);
                 esp_free(slotp);
                 exit(1);
             }
@@ -344,11 +347,7 @@ static int read_card(void)
 
 static void hot_exit(int n)
 {
-    if (g_modo_paralelo) {
-        printf("[Proceso %d] Cancelled with [%d]\n", g_proceso_id, n);
-    } else {
-        printf("Cancelled with [%d]\n", n);
-    }
+    printf("Cancelled with [%d]\n", n);
     esp_abort();
     exit(0);
 }
