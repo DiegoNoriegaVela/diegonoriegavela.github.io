@@ -1,53 +1,288 @@
-/**
- * Formatea reporte T150 (Excepciones)
- * Regla: Cada línea tiene exactamente 133 caracteres
+/*
+ * Uso: ./gentabcard <num_procesos>
+ * Ejemplo: ./gentabcard 4
  */
-private static void formatT150Report(String transmissionId, File inputFile, 
-        String outputFile, boolean debugMode) throws Exception {
+
+#include "fts_headers.h"
+#include <sys/utsname.h>
+#include <sys/wait.h>
+#include "pt_switch.h"
+
+/* Variables globales */
+char pan[50];
+char tracking;
+char offset[13];
+char pin_offset[5];
+char useoffset;
+char date_cp[9];
+char embossing[107];
+char birthdate[11];
+char expdate[5];
+time_t now;
+
+FILE *fp;
+int g_offset = 0;      // offset del proceso actual
+int g_cantidad = 0;    // cantidad a procesar
+int g_proceso_id = 0;  // identificador del proceso
+
+/* Prototipos */
+static int contar_registros();
+static int read_card();
+static void hot_exit(int n);
+static void print_card_info();
+static void abrir_archivo();
+
+int main(int argc, char **argv, char **env)
+{
+    int num_procesos = 4;  // default
+    int total_registros;
+    int chunk;
+    int i;
+    pid_t pid;
+    int status;
     
-    if (DEBUG || debugMode) {
-        System.out.println("DEBUG: Aplicando formato T150 (133 caracteres por línea)");
-    }
-
-    try (BufferedReader reader = new BufferedReader(new FileReader(inputFile));
-         PrintWriter writer = new PrintWriter(new FileWriter(outputFile))) {
-
-        // Escribir header
-        writer.println("[" + transmissionId + "]");
-
-        // Leer todo el contenido
-        StringBuilder content = new StringBuilder();
-        String line;
-        while ((line = reader.readLine()) != null) {
-            content.append(line);
+    system("clear");
+    printf("=== Generacion de Archivo Tabcard (Paralelo) ===\n\n");
+    
+    if (argc >= 2) {
+        num_procesos = atoi(argv[1]);
+        if (num_procesos < 1 || num_procesos > 16) {
+            printf("Error: num_procesos debe ser entre 1 y 16\n");
+            exit(1);
         }
-
-        String fullText = content.toString();
+    }
+    
+    printf("Subprocesos configurados: %d\n", num_procesos);
+    
+    /* Conectar a BD para contar */
+    sw_logon_database(1);
+    
+    /* Contar total de registros */
+    total_registros = contar_registros();
+    printf("Total de registros a procesar: %d\n", total_registros);
+    
+    if (total_registros == 0) {
+        printf("No hay registros para procesar\n");
+        exit(0);
+    }
+    
+    /* Calcular chunk por proceso */
+    chunk = (total_registros + num_procesos - 1) / num_procesos;  // redondeo hacia arriba
+    printf("Registros por proceso: ~%d\n\n", chunk);
+    
+    /* Crear procesos hijos */
+    for (i = 0; i < num_procesos; i++) {
+        pid = fork();
         
-        if (DEBUG || debugMode) {
-            System.out.println("DEBUG: Longitud total del texto: " + fullText.length());
+        if (pid < 0) {
+            perror("Error en fork");
+            exit(1);
         }
-
-        // Cortar en bloques de 133 caracteres
-        int charsPerLine = 133;
-        int totalChars = fullText.length();
-        int linesWritten = 0;
-
-        for (int i = 0; i < totalChars; i += charsPerLine) {
-            int end = Math.min(i + charsPerLine, totalChars);
-            String chunk = fullText.substring(i, end);
-            writer.println(chunk);
-            linesWritten++;
+        else if (pid == 0) {
+            /* PROCESO HIJO */
+            g_proceso_id = i;
+            g_offset = i * chunk;
+            g_cantidad = chunk;
             
-            if (DEBUG || debugMode && linesWritten <= 5) {
-                String preview = chunk.length() > 40 ? chunk.substring(0, 40) + "..." : chunk;
-                System.out.println("DEBUG: Línea " + linesWritten + ": " + chunk.length() + 
-                    " chars - \"" + preview + "\"");
+            /* Ajustar último proceso para no pasarse */
+            if (g_offset + g_cantidad > total_registros) {
+                g_cantidad = total_registros - g_offset;
             }
+            
+            printf("[Proceso %d] Iniciando: registros %d a %d\n", 
+                   i, g_offset + 1, g_offset + g_cantidad);
+            
+            /* Cada hijo abre su propia conexión */
+            sw_logon_database(1);
+            plHandleSignals(0, hot_exit);
+            abrir_archivo();
+            read_card();
+            
+            printf("[Proceso %d] Terminado\n", g_proceso_id);
+            exit(0);
         }
-
-        if (DEBUG || debugMode) {
-            System.out.println("DEBUG: Total de líneas escritas: " + linesWritten);
-        }
+        /* El padre continúa el loop */
     }
+    
+    /* PROCESO PADRE: esperar a todos los hijos */
+    printf("Padre esperando a %d procesos...\n", num_procesos);
+    for (i = 0; i < num_procesos; i++) {
+        wait(&status);
+    }
+    
+    /* Unir archivos */
+    printf("\nUniendo archivos...\n");
+    char cmd[256];
+    sprintf(cmd, "cat %s/tabcard_*.txt > %s/tabcard_final.txt", 
+            getenv("LOGDIR"), getenv("LOGDIR"));
+    system(cmd);
+    
+    printf("\n=== COMPLETADO ===\n");
+    printf("Archivo final: %s/tabcard_final.txt\n", getenv("LOGDIR"));
+    
+    return 0;
+}
+
+static int contar_registros()
+{
+    char command[300];
+    ESP_SLOT slot;
+    ESP_SLOTP slotp = &slot;
+    int total = 0;
+    char count_str[20];
+    
+    sprintf(command,
+        "SELECT COUNT(*) as total FROM card "
+        "WHERE (pan IS NOT NULL) "
+        "AND (bin NOT IN ('890507','890502','890506','890530'))");
+    
+    pl_log(LOG_DEBUG, "Count query [%s]\n", command);
+    
+    if (esp_read(slotp, "card", command, ESP_LOOK)) {
+        pl_log(LOG_DEBUG, "ESP_READ ERROR: [%s]", (char*)*Last_error);
+        return 0;
+    }
+    
+    if (!esp_fetch(slotp)) {
+        esp_get(slotp, "total", count_str);
+        total = atoi(count_str);
+    }
+    
+    esp_free(slotp);
+    return total;
+}
+
+static void abrir_archivo()
+{
+    char filename[100];
+    memset(filename, '\0', sizeof(filename));
+    
+    /* Cada proceso escribe a su propio archivo */
+    sprintf(filename, "%s/tabcard_%02d.txt", getenv("LOGDIR"), g_proceso_id);
+    
+    fp = fopen(filename, "w");
+    if (fp == NULL) {
+        printf("[Proceso %d] Could not open file %s\n", g_proceso_id, filename);
+        exit(1);
+    }
+}
+
+static int read_card()
+{
+    char command[500];
+    int cnttmp = 0;
+    int cnttotal = 0;
+    int tope = 4;
+    char enc_wall;
+    ESP_SLOT slot;
+    ESP_SLOTP slotp = &slot;
+    
+    memset(command, '\0', sizeof(command));
+    
+    /* Query con paginación usando ROWNUM */
+    sprintf(command,
+        "SELECT * FROM ("
+        "  SELECT a.*, ROWNUM rn FROM ("
+        "    SELECT * FROM card "
+        "    WHERE (pan IS NOT NULL) "
+        "    AND (bin NOT IN ('890507','890502','890506','890530')) "
+        "    ORDER BY rowid"
+        "  ) a WHERE ROWNUM <= %d"
+        ") WHERE rn > %d",
+        g_offset + g_cantidad,
+        g_offset);
+    
+    pl_log(LOG_DEBUG, "[Proceso %d] Query [%s]\n", g_proceso_id, command);
+    
+    if (esp_read(slotp, "card", command, ESP_LOOK)) {
+        pl_log(LOG_DEBUG, "ESP_READ ERROR: [%s]", (char*)*Last_error);
+        fprintf(stderr, "[Proceso %d] Can't read CARD Table!: %s\n", 
+                g_proceso_id, (char*)*Last_error);
+        exit(1);
+    }
+    
+    while (!esp_fetch(slotp)) {
+        cnttmp++;
+        cnttotal++;
+        
+        enc_wall = 'N';
+        tracking = 'H';
+        useoffset = 'N';
+        
+        memset(pan, '\0', sizeof(pan));
+        memset(offset, '\0', sizeof(offset));
+        memset(pin_offset, '\0', sizeof(pin_offset));
+        memset(date_cp, '\0', sizeof(date_cp));
+        memset(embossing, '\0', sizeof(embossing));
+        memset(birthdate, '\0', sizeof(birthdate));
+        memset(expdate, '\0', sizeof(expdate));
+        
+        esp_get(slotp, "tracking", &tracking);
+        esp_get(slotp, "offset", offset);
+        esp_get(slotp, "pin_offset", pin_offset);
+        esp_get(slotp, "useoffset", &useoffset);
+        esp_get(slotp, "date_cp", date_cp);
+        esp_get(slotp, "embossing", embossing);
+        esp_get(slotp, "birthdate", birthdate);
+        esp_get(slotp, "exp_date", expdate);
+        esp_get(slotp, "enc_wall", &enc_wall);
+        
+        if (enc_wall == 'Y') {
+            if (esp_get(slotp, "pan", pan, ENCTRUE)) {
+                pl_log(LOG_DEBUG, "%s", (char*)*Last_error);
+                esp_free(slotp);
+                exit(1);
+            }
+        } else {
+            esp_get(slotp, "pan", pan);
+        }
+        
+        if (cnttmp == tope) {
+            time(&now);
+            cnttmp = 0;
+        }
+        
+        print_card_info();
+    }
+    
+    printf("[Proceso %d] Registros procesados: %d\n", g_proceso_id, cnttotal);
+    esp_free(slotp);
+    fclose(fp);
+    
+    return 0;
+}
+
+static void print_card_info()
+{
+    char record[300], *p;
+    
+    memset(record, 0, sizeof(record));
+    p = record;
+    p += sprintf(p, "%-19s", pan);
+    p += sprintf(p, " ");
+    p += sprintf(p, "%c", tracking);
+    p += sprintf(p, " ");
+    p += sprintf(p, "%-12s", offset);
+    p += sprintf(p, " ");
+    p += sprintf(p, "%-4s", pin_offset);
+    p += sprintf(p, " ");
+    p += sprintf(p, "%c", useoffset);
+    p += sprintf(p, " ");
+    p += sprintf(p, "%-8s", date_cp);
+    p += sprintf(p, " ");
+    p += sprintf(p, "%-28s", embossing);
+    p += sprintf(p, " ");
+    p += sprintf(p, "%-10s", birthdate);
+    p += sprintf(p, " ");
+    p += sprintf(p, "%-4s", expdate);
+    
+    fprintf(fp, "%s\n", record);
+    fflush(fp);
+}
+
+static void hot_exit(int n)
+{
+    printf("[Proceso %d] Cancelled with [%d]\n", g_proceso_id, n);
+    esp_abort();
+    exit(0);
 }
