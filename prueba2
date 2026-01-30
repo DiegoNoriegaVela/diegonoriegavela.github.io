@@ -1,6 +1,14 @@
 /*
- * Uso: ./gentabcard <num_procesos>
- * Ejemplo: ./gentabcard 4
+ * #Nombre      : gentabcard
+ * #Descripcion : Generacion del archivo Tabcard.txt
+ * #Autor       : Cesar Mesta - SES
+ * #Fecha       : 09-10-2023
+ * #Modificado  : Paralelizacion con fork()
+ *
+ * USO:
+ *   ./gentabcard           -> Comportamiento original (sin paralelizar)
+ *   ./gentabcard 4         -> Paraleliza en 4 procesos
+ *   ./gentabcard 8         -> Paraleliza en 8 procesos
  */
 
 #include "fts_headers.h"
@@ -8,7 +16,14 @@
 #include <sys/wait.h>
 #include "pt_switch.h"
 
-/* Variables globales */
+/*Declaracion de parrafos o funciones*/
+static int read_card();
+static void hot_exit(int n);
+static void print_card_info();
+static void abrir_archivo();
+static int contar_registros();
+
+/* Declaracion de Variables*/
 char pan[50];
 char tracking;
 char offset[13];
@@ -18,23 +33,23 @@ char date_cp[9];
 char embossing[107];
 char birthdate[11];
 char expdate[5];
+
+/*Para obtener la Hora del sistema*/
 time_t now;
 
-FILE *fp;
-int g_offset = 0;      // offset del proceso actual
-int g_cantidad = 0;    // cantidad a procesar
-int g_proceso_id = 0;  // identificador del proceso
+extern char *argv0;
 
-/* Prototipos */
-static int contar_registros();
-static int read_card();
-static void hot_exit(int n);
-static void print_card_info();
-static void abrir_archivo();
+FILE *fp;       /* Declaracion de archivo*/
+
+/* Variables para paralelizacion */
+int g_offset = 0;
+int g_cantidad = 0;
+int g_proceso_id = -1;  /* -1 = modo original, >=0 = modo paralelo */
+int g_modo_paralelo = 0;
 
 int main(int argc, char **argv, char **env)
 {
-    int num_procesos = 4;  // default
+    int num_procesos = 0;
     int total_registros;
     int chunk;
     int i;
@@ -42,22 +57,35 @@ int main(int argc, char **argv, char **env)
     int status;
     
     system("clear");
-    printf("=== Generacion de Archivo Tabcard (Paralelo) ===\n\n");
+    printf("%s \n", " Generacion de Archivo Tabcard ");
     
+    /* Verificar si se pide modo paralelo */
     if (argc >= 2) {
         num_procesos = atoi(argv[1]);
         if (num_procesos < 1 || num_procesos > 16) {
-            printf("Error: num_procesos debe ser entre 1 y 16\n");
+            printf("Error: numero de procesos debe ser entre 1 y 16\n");
+            printf("Uso: %s [num_procesos]\n", argv[0]);
+            printf("  Sin parametros = modo original\n");
+            printf("  Con parametro  = modo paralelo\n");
             exit(1);
         }
+        g_modo_paralelo = 1;
+        printf("Modo PARALELO con %d procesos\n\n", num_procesos);
+    } else {
+        printf("Modo ORIGINAL (sin paralelizar)\n\n");
     }
     
-    printf("Subprocesos configurados: %d\n", num_procesos);
+    sw_logon_database(1);       /* Ingreso a la BD*/
     
-    /* Conectar a BD para contar */
-    sw_logon_database(1);
+    /* MODO ORIGINAL - sin paralelizar */
+    if (!g_modo_paralelo) {
+        plHandleSignals(0, hot_exit);
+        abrir_archivo();
+        read_card();
+        return 0;
+    }
     
-    /* Contar total de registros */
+    /* MODO PARALELO - con fork */
     total_registros = contar_registros();
     printf("Total de registros a procesar: %d\n", total_registros);
     
@@ -66,8 +94,7 @@ int main(int argc, char **argv, char **env)
         exit(0);
     }
     
-    /* Calcular chunk por proceso */
-    chunk = (total_registros + num_procesos - 1) / num_procesos;  // redondeo hacia arriba
+    chunk = (total_registros + num_procesos - 1) / num_procesos;
     printf("Registros por proceso: ~%d\n\n", chunk);
     
     /* Crear procesos hijos */
@@ -84,15 +111,17 @@ int main(int argc, char **argv, char **env)
             g_offset = i * chunk;
             g_cantidad = chunk;
             
-            /* Ajustar último proceso para no pasarse */
+            if (g_offset >= total_registros) {
+                exit(0);
+            }
+            
             if (g_offset + g_cantidad > total_registros) {
                 g_cantidad = total_registros - g_offset;
             }
             
-            printf("[Proceso %d] Iniciando: registros %d a %d\n", 
+            printf("[Proceso %d] Iniciando: registros %d a %d\n",
                    i, g_offset + 1, g_offset + g_cantidad);
             
-            /* Cada hijo abre su propia conexión */
             sw_logon_database(1);
             plHandleSignals(0, hot_exit);
             abrir_archivo();
@@ -101,20 +130,23 @@ int main(int argc, char **argv, char **env)
             printf("[Proceso %d] Terminado\n", g_proceso_id);
             exit(0);
         }
-        /* El padre continúa el loop */
     }
     
     /* PROCESO PADRE: esperar a todos los hijos */
-    printf("Padre esperando a %d procesos...\n", num_procesos);
+    printf("Esperando a %d procesos...\n", num_procesos);
     for (i = 0; i < num_procesos; i++) {
         wait(&status);
     }
     
     /* Unir archivos */
     printf("\nUniendo archivos...\n");
-    char cmd[256];
-    sprintf(cmd, "cat %s/tabcard_*.txt > %s/tabcard_final.txt", 
+    char cmd[512];
+    sprintf(cmd, "cat %s/tabcard_*.txt > %s/tabcard_final.txt 2>/dev/null",
             getenv("LOGDIR"), getenv("LOGDIR"));
+    system(cmd);
+    
+    /* Limpiar archivos temporales */
+    sprintf(cmd, "rm -f %s/tabcard_[0-9]*.txt 2>/dev/null", getenv("LOGDIR"));
     system(cmd);
     
     printf("\n=== COMPLETADO ===\n");
@@ -131,6 +163,9 @@ static int contar_registros()
     int total = 0;
     char count_str[20];
     
+    memset(command, '\0', sizeof(command));
+    memset(count_str, '\0', sizeof(count_str));
+    
     sprintf(command,
         "SELECT COUNT(*) as total FROM card "
         "WHERE (pan IS NOT NULL) "
@@ -140,6 +175,7 @@ static int contar_registros()
     
     if (esp_read(slotp, "card", command, ESP_LOOK)) {
         pl_log(LOG_DEBUG, "ESP_READ ERROR: [%s]", (char*)*Last_error);
+        fprintf(stderr, "Error contando registros\n");
         return 0;
     }
     
@@ -155,101 +191,24 @@ static int contar_registros()
 static void abrir_archivo()
 {
     char filename[100];
+    
     memset(filename, '\0', sizeof(filename));
     
-    /* Cada proceso escribe a su propio archivo */
-    sprintf(filename, "%s/tabcard_%02d.txt", getenv("LOGDIR"), g_proceso_id);
+    if (g_modo_paralelo) {
+        /* Modo paralelo: archivo por proceso */
+        sprintf(filename, "%s/tabcard_%02d.txt", getenv("LOGDIR"), g_proceso_id);
+    } else {
+        /* Modo original: archivo unico */
+        sprintf(filename, "%s/tabcard.txt", getenv("LOGDIR"));
+    }
     
     fp = fopen(filename, "w");
-    if (fp == NULL) {
-        printf("[Proceso %d] Could not open file %s\n", g_proceso_id, filename);
+    if (fp == NULL)
+    {
+        printf("Could not open file %s\n", filename);
+        fclose(fp);
         exit(1);
     }
-}
-
-static int read_card()
-{
-    char command[500];
-    int cnttmp = 0;
-    int cnttotal = 0;
-    int tope = 4;
-    char enc_wall;
-    ESP_SLOT slot;
-    ESP_SLOTP slotp = &slot;
-    
-    memset(command, '\0', sizeof(command));
-    
-    /* Query con paginación usando ROWNUM */
-    sprintf(command,
-        "SELECT * FROM ("
-        "  SELECT a.*, ROWNUM rn FROM ("
-        "    SELECT * FROM card "
-        "    WHERE (pan IS NOT NULL) "
-        "    AND (bin NOT IN ('890507','890502','890506','890530')) "
-        "    ORDER BY rowid"
-        "  ) a WHERE ROWNUM <= %d"
-        ") WHERE rn > %d",
-        g_offset + g_cantidad,
-        g_offset);
-    
-    pl_log(LOG_DEBUG, "[Proceso %d] Query [%s]\n", g_proceso_id, command);
-    
-    if (esp_read(slotp, "card", command, ESP_LOOK)) {
-        pl_log(LOG_DEBUG, "ESP_READ ERROR: [%s]", (char*)*Last_error);
-        fprintf(stderr, "[Proceso %d] Can't read CARD Table!: %s\n", 
-                g_proceso_id, (char*)*Last_error);
-        exit(1);
-    }
-    
-    while (!esp_fetch(slotp)) {
-        cnttmp++;
-        cnttotal++;
-        
-        enc_wall = 'N';
-        tracking = 'H';
-        useoffset = 'N';
-        
-        memset(pan, '\0', sizeof(pan));
-        memset(offset, '\0', sizeof(offset));
-        memset(pin_offset, '\0', sizeof(pin_offset));
-        memset(date_cp, '\0', sizeof(date_cp));
-        memset(embossing, '\0', sizeof(embossing));
-        memset(birthdate, '\0', sizeof(birthdate));
-        memset(expdate, '\0', sizeof(expdate));
-        
-        esp_get(slotp, "tracking", &tracking);
-        esp_get(slotp, "offset", offset);
-        esp_get(slotp, "pin_offset", pin_offset);
-        esp_get(slotp, "useoffset", &useoffset);
-        esp_get(slotp, "date_cp", date_cp);
-        esp_get(slotp, "embossing", embossing);
-        esp_get(slotp, "birthdate", birthdate);
-        esp_get(slotp, "exp_date", expdate);
-        esp_get(slotp, "enc_wall", &enc_wall);
-        
-        if (enc_wall == 'Y') {
-            if (esp_get(slotp, "pan", pan, ENCTRUE)) {
-                pl_log(LOG_DEBUG, "%s", (char*)*Last_error);
-                esp_free(slotp);
-                exit(1);
-            }
-        } else {
-            esp_get(slotp, "pan", pan);
-        }
-        
-        if (cnttmp == tope) {
-            time(&now);
-            cnttmp = 0;
-        }
-        
-        print_card_info();
-    }
-    
-    printf("[Proceso %d] Registros procesados: %d\n", g_proceso_id, cnttotal);
-    esp_free(slotp);
-    fclose(fp);
-    
-    return 0;
 }
 
 static void print_card_info()
@@ -276,13 +235,120 @@ static void print_card_info()
     p += sprintf(p, " ");
     p += sprintf(p, "%-4s", expdate);
     
-    fprintf(fp, "%s\n", record);
+    fprintf(fp, "%s \n", record);
     fflush(fp);
+    free(p);
+    free(record);
+}
+
+static int read_card()
+{
+    char command[600];
+    int cnttmp = 0;
+    int cnttotal = 0;
+    int tope = 4;
+    char enc_wall;
+    ESP_SLOT slot;
+    ESP_SLOTP slotp = &slot;
+    
+    memset(command, '\0', sizeof(command));
+    
+    if (g_modo_paralelo) {
+        /* Query con paginacion para modo paralelo */
+        sprintf(command,
+            "SELECT * FROM ("
+            "  SELECT a.*, ROWNUM rn FROM ("
+            "    SELECT * FROM card "
+            "    WHERE (pan IS NOT NULL) "
+            "    AND (bin NOT IN ('890507','890502','890506','890530')) "
+            "    ORDER BY rowid"
+            "  ) a WHERE ROWNUM <= %d"
+            ") WHERE rn > %d",
+            g_offset + g_cantidad,
+            g_offset);
+    } else {
+        /* Query original */
+        sprintf(command,
+            "SELECT * FROM card "
+            "WHERE (pan IS NOT NULL) "
+            "AND (bin NOT IN ('890507','890502','890506','890530')) "
+            "ORDER BY rowid");
+    }
+    
+    pl_log(LOG_DEBUG, "Command [%s]\n", command);
+    
+    if (esp_read(slotp, "card", command, ESP_LOOK))
+    {
+        pl_log(LOG_DEBUG, "ESP_READ ERROR: [%s]", (char*)*Last_error);
+        fprintf(stderr, "Can't read CARD Table!: %s\n", (char*)*Last_error);
+        exit(1);
+    }
+    
+    while (!esp_fetch(slotp))
+    {
+        cnttmp++;
+        cnttotal++;
+        
+        enc_wall = 'N';
+        tracking = 'H';
+        useoffset = 'N';
+        
+        memset(pan, '\0', sizeof(pan));
+        memset(offset, '\0', sizeof(offset));
+        memset(pin_offset, '\0', sizeof(pin_offset));
+        memset(date_cp, '\0', sizeof(date_cp));
+        memset(embossing, '\0', sizeof(embossing));
+        memset(birthdate, '\0', sizeof(birthdate));
+        memset(expdate, '\0', sizeof(expdate));
+        
+        esp_get(slotp, "tracking", &tracking);
+        esp_get(slotp, "offset", offset);
+        esp_get(slotp, "pin_offset", pin_offset);
+        esp_get(slotp, "useoffset", &useoffset);
+        esp_get(slotp, "date_cp", date_cp);
+        esp_get(slotp, "embossing", embossing);
+        esp_get(slotp, "birthdate", birthdate);
+        esp_get(slotp, "exp_date", expdate);
+        esp_get(slotp, "enc_wall", &enc_wall);
+        
+        if (enc_wall == 'Y')
+        {
+            if (esp_get(slotp, "pan", pan, ENCTRUE))
+            {
+                pl_log(LOG_DEBUG, "%s", (char*)*Last_error);
+                esp_free(slotp);
+                exit(1);
+            }
+        }
+        else
+        {
+            esp_get(slotp, "pan", pan);
+        }
+        
+        if (cnttmp == tope)
+        {
+            time(&now);
+            cnttmp = 0;
+        }
+        
+        print_card_info();
+    }
+    
+    printf("\n");
+    esp_free(slotp);
+    fclose(fp);
+    printf("Total de registros leidos: %d\n", cnttotal);
+    
+    return 0;
 }
 
 static void hot_exit(int n)
 {
-    printf("[Proceso %d] Cancelled with [%d]\n", g_proceso_id, n);
+    if (g_modo_paralelo) {
+        printf("[Proceso %d] Cancelled with [%d]\n", g_proceso_id, n);
+    } else {
+        printf("Cancelled with [%d]\n", n);
+    }
     esp_abort();
     exit(0);
 }
